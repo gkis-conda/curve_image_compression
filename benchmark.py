@@ -1,29 +1,16 @@
 """
 ===============================================================================
-                    BENCHMARK & PERFORMANCE EVALUATION
-===============================================================================
-
-  "We weigh the shadow against the sun,
-   To measure what the mesh has won."
-
-  A standalone harness that loads image manifolds, measures encoding and
-  decoding execution latency, calculates fidelity metrics (PSNR, SSIM),
-  and computes bitstream compression efficiency.
-
-===============================================================================
-"""
-"""
-===============================================================================
-              FRACTAL CODEC INTEGRATION BENCHMARK
+             BENCHMARK & PERFORMANCE EVALUATION
+             IMAGE CODEC INTEGRATION BENCHMARK
 ===============================================================================
 
   "Our revels now are ended. These our actors,
    As I foretold you, were all spirits..."
   -- William Shakespeare, The Tempest
 
-  Complete pipeline: image loading, encoding, decoding, and benchmarking.
-  Imports encode_fractal_mesh and decode_fractal_mesh from implementation.
-  Calculates PSNR, SSIM, BPP, and latency, logging status via dramatic logger.
+  A standalone harness that loads image manifolds, instantiates the Codec
+  with configuration bundles, measures encoding/decoding execution latency,
+  calculates fidelity metrics (PSNR, SSIM), and computes compression efficiency.
 
 ===============================================================================
 """
@@ -38,16 +25,15 @@ import cv2
 from dramatic_logger import log_event
 
 # -----------------------------------------------------------------------------
-# DYNAMIC IMPLEMENTATION IMPORT FROM CODEC / STUB MODULE
+# DYNAMIC IMPLEMENTATION IMPORT FROM CODEC MODULE
 # -----------------------------------------------------------------------------
 try:
-    from codec import encode_fractal_mesh, decode_fractal_mesh
+    from codec import Codec
 except ImportError:
     try:
-        from codec_stub import encode_fractal_mesh, decode_fractal_mesh
+        from codec_stub import Codec
     except ImportError:
-        encode_fractal_mesh = None
-        decode_fractal_mesh = None
+        Codec = None
 
 
 def calculate_psnr(original: np.ndarray, reconstructed: np.ndarray) -> float:
@@ -103,12 +89,12 @@ def psnr_and_ssim_to_pathos(psnr: float, ssim: float) -> int:
         return -5
 
 
-def run_benchmark(image_path: str, target_anchors: int = 300):
+def run_benchmark(image_path: str):
     """
-    Executes complete pipeline: loading, encoding, decoding, and benchmarking.
+    Executes complete pipeline: instantiation, loading, encoding, decoding, and benchmarking.
     """
     # Guard check for missing implementation
-    if encode_fractal_mesh is None or decode_fractal_mesh is None:
+    if Codec is None:
         log_event("Codec Implementation Import Failure", topic="file_io", pathos=-5)
         return
 
@@ -126,16 +112,26 @@ def run_benchmark(image_path: str, target_anchors: int = 300):
     h, w = img_orig.shape
     raw_size_bytes = img_orig.nbytes
 
+    # Define codec tuning configuration bundle for constructor
+    codec_config = {
+        "target_anchors": 300,
+        "tolerance": 0.01,
+        "r_l1": 2
+    }
+    
+    # Instantiate the codec with configuration parameters
+    codec = Codec(**codec_config)
+
     log_event(
         f"Processing Canvas: {os.path.basename(image_path)} ({w}x{h} px) | "
-        f"Raw: {raw_size_bytes / 1024.0:.2f} KB | Anchors Target: {target_anchors}",
+        f"Raw: {raw_size_bytes / 1024.0:.2f} KB | Config: {codec_config}",
         topic="file_io",
         pathos=1,
     )
 
-    # Encode domain surface into fractal stream
+    # Encode domain surface into fractal stream using codec instance
     t0 = time.perf_counter()
-    bitstream = encode_fractal_mesh(img_orig, target_anchors=target_anchors)
+    bitstream = codec.encode(img_orig)
     t_enc = (time.perf_counter() - t0) * 1000.0
 
     compressed_size_bytes = len(bitstream)
@@ -144,9 +140,9 @@ def run_benchmark(image_path: str, target_anchors: int = 300):
         raw_size_bytes / compressed_size_bytes if compressed_size_bytes > 0 else 0.0
     )
 
-    # Decode fractal stream back into spatial manifold
+    # Decode fractal stream back into spatial manifold using codec instance
     t0 = time.perf_counter()
-    img_recon = decode_fractal_mesh(bitstream)
+    img_recon = codec.decode(bitstream)
     t_dec = (time.perf_counter() - t0) * 1000.0
 
     # Compute reconstruction fidelity metrics
@@ -170,7 +166,6 @@ def run_benchmark(image_path: str, target_anchors: int = 300):
 
 
 if __name__ == "__main__":
-    # Check CLI arguments or fall back to synthetic canvas
     if len(sys.argv) > 1:
         test_path = sys.argv[1]
     else:
@@ -181,4 +176,4 @@ if __name__ == "__main__":
             cv2.imwrite(test_path, synthetic)
             log_event(f"Synthetic Target Created: '{test_path}'", topic="file_io", pathos=0)
 
-    run_benchmark(test_path, target_anchors=300)
+    run_benchmark(test_path)

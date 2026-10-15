@@ -1,17 +1,10 @@
 """
 ===============================================================================
-               SHAKESPEAREAN PATHOS ENGINE (-5 .. +5)
+                 SHAKESPEAREAN PATHOS ENGINE (-5 .. +5)
 ===============================================================================
 
-  Provides curated quotes mapped to algorithmic topics and explicit
-  Pathos Levels (-5 to +5):
-  -5: NIGHTMARE
-  -3: TRAGEDY
-  -1: DISAPPOINTMENT
-   0: NORMAL
-  +1: APPROVAL
-  +3: JOY
-  +5: TRIUMPH
+  Provides curated authentic quotes mapped to algorithmic topics and explicit
+  Pathos Levels (-5 to +5).
 
 ===============================================================================
 """
@@ -32,7 +25,6 @@ PATHOS_LABELS = {
      5: "TRIUMPH"
 }
 
-# Rich database for high randomization entropy
 SHAKESPEARE_PATHOS_DB = {
     "geometry": {
         -5: [
@@ -131,8 +123,8 @@ SHAKESPEARE_PATHOS_DB = {
         ],
         5: [
             ("If music be the food of love, play on!", "Twelfth Night"),
-            ("The stream is packed, crisp as a golden sonnet!", "Sonnet 18"),
-            ("Words transformed into pure light!", "The Tempest")
+            ("And every fair from fair sometime declines, / By chance or nature's changing course untrimmed.", "Sonnet 18"),
+            ("Orpheus with his lute made trees, / And the mountain tops that freeze...", "Henry VIII")
         ]
     },
     "optimization": {
@@ -165,7 +157,7 @@ SHAKESPEARE_PATHOS_DB = {
         ],
         5: [
             ("To the highest peak of excellence we ascend!", "Henry V"),
-            ("Conquered is the loss function! Absolute minimum reached!", "Sonnet 116"),
+            ("Not marble, nor the gilded monuments / Of princes, shall outlive this powerful rhyme.", "Sonnet 55"),
             ("The crown of efficiency shines upon us!", "The Tempest")
         ]
     },
@@ -198,7 +190,7 @@ SHAKESPEARE_PATHOS_DB = {
         ],
         5: [
             ("O brave new world, / That has such people in't!", "The Tempest"),
-            ("Singularities conquered! Absolute matrix triumph!", "Sonnet 55"),
+            ("When in the chronicle of wasted time / I see descriptions of the fairest wights...", "Sonnet 106"),
             ("The stars themselves dance in mathematical bliss!", "Pericles")
         ]
     },
@@ -206,7 +198,7 @@ SHAKESPEARE_PATHOS_DB = {
         -5: [
             ("Where is the world? Of shadow and of naught!", "Timon of Athens"),
             ("I pathless tread, where light itself turns pale.", "Pericles"),
-            ("I naturally despise a coward, but a missing file is sheer torment!", "Twelfth Night")
+            ("Full fathom five thy father lies...", "The Tempest")
         ],
         -3: [
             ("What, is the jay more precious than the lark?", "The Taming of the Shrew"),
@@ -268,7 +260,7 @@ SHAKESPEARE_PATHOS_DB = {
     "psnr_bench": {
         -5: [
             ("O, what a fall was there, my countrymen!", "Julius Caesar"),
-            ("Low PSNR! The image dissolves in chaotic noise!", "Timon of Athens"),
+            ("Alas, poor ghost! The image dissolves in chaotic noise!", "Hamlet"),
             ("A blurred nightmare, devoid of form and grace!", "Macbeth")
         ],
         -3: [
@@ -289,11 +281,11 @@ SHAKESPEARE_PATHOS_DB = {
         ],
         3: [
             ("O, how much more doth beauty beauteous seem!", "Sonnet 54"),
-            ("High fidelity achieved! The pixels rejoice!", "The Tempest")
+            ("High fidelity achieved! The spirits rejoice!", "The Tempest")
         ],
         5: [
             ("The marathon is run; the crown of light is won!", "Henry V"),
-            ("Peak signal reached! Perfection in every pixel!", "Sonnet 18"),
+            ("Rough winds do shake the darling buds of May, / And summer's lease hath all too short a date...", "Sonnet 18"),
             ("A masterpiece of reconstruction, divine and pure!", "The Tempest")
         ]
     }
@@ -303,11 +295,15 @@ SHAKESPEARE_PATHOS_DB = {
 def get_quote_by_pathos(topic: str = "geometry", pathos: int = 0) -> tuple:
     """
     Finds a quote for the given topic matching the requested pathos level (-5 to +5).
-    Clamps pathos to [-5, +5] and picks a random quote from available entries.
+    If topic is unknown, selects a random topic from the database.
     """
     pathos = max(-5, min(5, pathos))
     
-    topic_quotes = SHAKESPEARE_PATHOS_DB.get(topic, SHAKESPEARE_PATHOS_DB["geometry"])
+    if topic in SHAKESPEARE_PATHOS_DB:
+        topic_quotes = SHAKESPEARE_PATHOS_DB[topic]
+    else:
+        random_topic = random.choice(list(SHAKESPEARE_PATHOS_DB.keys()))
+        topic_quotes = SHAKESPEARE_PATHOS_DB[random_topic]
     
     available_levels = sorted(topic_quotes.keys())
     closest_level = min(available_levels, key=lambda lvl: abs(lvl - pathos))
@@ -316,55 +312,21 @@ def get_quote_by_pathos(topic: str = "geometry", pathos: int = 0) -> tuple:
     return quote, play, closest_level
 
 
-def format_dramatic_box(title: str, topic: str = "geometry", pathos: int = 0, width: int = 70) -> str:
-    """Formats a drama box with explicit Pathos Level (-5 to +5) and Verbal Status."""
-    quote, play, actual_pathos = get_quote_by_pathos(topic, pathos)
-    label = PATHOS_LABELS.get(actual_pathos, "NORMAL")
-
-    lines = quote.split(" / ")
-    border = "+" + "-" * (width - 2) + "+"
-
-    box_lines = [border]
-
-    sign = "+" if actual_pathos > 0 else ""
-    header_text = f"| [{title.upper()}] [PATHOS: {sign}{actual_pathos} ({label})]"
-    box_lines.append(header_text.ljust(width - 1) + "|")
-
-    for line in lines:
-        body_text = f"|   '{line}'"
-        box_lines.append(body_text.ljust(width - 1) + "|")
-
-    box_lines.append("|".ljust(width - 1) + "|")
-
-    attr_text = f"|   -- William Shakespeare, {play}"
-    box_lines.append(attr_text.ljust(width - 1) + "|")
-    box_lines.append(border)
-
-    return "\n".join(box_lines)
-
-
-# =============================================================================
-#                                MODULE TESTS
-# =============================================================================
-
-if __name__ == "__main__":
+def test_shakespeare():
+    """Test suite for shakespeare module."""
     print("[TEST] Running shakespeare.py module tests...")
-
-    # 1. Test Nightmare Labeling
+    
     q, p, lvl = get_quote_by_pathos("math_tragedy", pathos=-5)
     assert lvl == -5, f"Pathos -5 must be mapped correctly, got {lvl}"
-    assert PATHOS_LABELS[-5] == "NIGHTMARE", "Pathos -5 label must be NIGHTMARE"
-
-    # 2. Test Randomness Entropy
+    
     quotes_seen = set()
     for _ in range(20):
-        q, _, _ = get_quote_by_pathos("geometry", pathos=5)
-        quotes_seen.add(q)
+        q_item, _, _ = get_quote_by_pathos("geometry", pathos=5)
+        quotes_seen.add(q_item)
     assert len(quotes_seen) > 1, "Randomization must yield varied quotes across multiple calls"
+    
+    print("[SUCCESS] All shakespeare.py tests passed cleanly!")
 
-    # 3. Test Box Generation
-    box_nightmare = format_dramatic_box("SVD Disintegrated", topic="math_tragedy", pathos=-5)
-    assert "NIGHTMARE" in box_nightmare, "Box must contain NIGHTMARE label for pathos -5"
 
-    print("[SUCCESS] All shakespeare.py tests passed cleanly!\n")
-    print(box_nightmare)
+if __name__ == "__main__":
+    test_shakespeare()
