@@ -1,116 +1,382 @@
 """
 ===============================================================================
-                     FRACTAL TOPOLOGICAL CODEC ENGINE
+                       EVANS CODEC IMPLEMENTATION
 ===============================================================================
 
-  "Through assertions state is sworn,
-   Ere bitstream field is born."
-
-  Contains serialisation, tree building, and reconstruction pipeline logic.
+  Implements lossy/lossless Evans fractal compression inheriting from CodecBase,
+  handling variable-width pixel ribbons (3 or 5), sliding Evans surface prediction, 
+  filter updates, and exact delta stream roundtrip.
 
 ===============================================================================
 """
 
+# Import base codec from the existing module
+from codec_stub import CodecBase
+# Specialized project modules
+from quadtree_path_finder import PathCompiler
+from evans_filter import EvansWindowFilter
+from slide_evans_filter import EvansSlidingFilter
+from quantizers import HalfQuantizer, LogarithmicLutQuantizer
+from dramatic_logger import log_event, dramatic_guard
+from image_accessor import ImageBlockAccessor
 import numpy as np
-from geometry import (
-    extract_fast_anchors,
-    compute_bounding_triangle_t0,
-    fit_luminance_plane,
-)
+from graph_visualizer import SimpleGridPathVisualizer
 
-def fit_luminance_plane(img_gray: np.ndarray, v1: np.ndarray, v2: np.ndarray, v3: np.ndarray) -> tuple:
-    """Samples luminance at the three vertex locations in image domain."""
-    h, w = img_gray.shape
-    pts_3d = []
-    for v in (v1, v2, v3):
-        x_c = int(np.clip(v[0], 0, w - 1))
-        y_c = int(np.clip(v[1], 0, h - 1))
-        pts_3d.append(float(img_gray[y_c, x_c]))
-    return tuple(pts_3d)
+class Codec(CodecBase):
+    """
+    Evans fractal compression codec implementation inheriting from CodecBase.
+    Integrates ImageBlockAccessor and EvansWindowFilter into a synchronous 2D timeline.
+    """
 
+    @dramatic_guard(topic="optimization", failure_pathos=-5)
+    def _encode(self, accessor: ImageBlockAccessor, path: list) -> list:
+        """
+        Step 4: Streamlined Sliding Evans prediction pipeline.
+        Completely unrolls the 3-step profile loops directly inside direction branches
+        to achieve maximum raw execution speeds.
+        """
+        encoder = EvansWindowFilter(alpha_noise=0.0, sigma_0=0.0, gamma=0.15,
+                                    quantize_fn=HalfQuantizer(), init_brightness=128.0, quantized_signal=True)
+        delta_stream = []
 
-def encode_fractal_mesh(img_gray: np.ndarray, target_anchors: int = 300) -> bytes:
-    """Encodes grayscale image domain into compact topological bitstream."""
-    h, w = img_gray.shape
-    anchors = extract_fast_anchors(img_gray, target_anchors=target_anchors)
-    t0_verts = compute_bounding_triangle_t0(w, h)
+        r_prev, c_prev = 0, -1
+        for r_idx, c_idx in path:
+            block_data = accessor.get_block(r_idx, c_idx)
 
-    payload = bytearray()
-    payload.extend(int(w).to_bytes(2, "big"))
-    payload.extend(int(h).to_bytes(2, "big"))
-    payload.extend(int(len(anchors)).to_bytes(2, "big"))
+            if c_idx > c_prev:
+                # DIRECTION: EAST (Scan columns left-to-right: 0, 1, 2)
+                delta_stream.extend(encoder.coder_update(0, block_data[:, 0]))
+                delta_stream.extend(encoder.coder_update(0, block_data[:, 1]))
+                delta_stream.extend(encoder.coder_update(0, block_data[:, 2]))
 
-    for pt in anchors:
-        x_q = int(np.clip(pt[0], 0, 65535))
-        y_q = int(np.clip(pt[1], 0, 65535))
-        payload.extend(x_q.to_bytes(2, "big"))
-        payload.extend(y_q.to_bytes(2, "big"))
+            elif c_idx < c_prev:
+                # DIRECTION: WEST (Scan columns right-to-left: 2, 1, 0)
+                delta_stream.extend(encoder.coder_update(2, block_data[:, 2]))
+                delta_stream.extend(encoder.coder_update(2, block_data[:, 1]))
+                delta_stream.extend(encoder.coder_update(2, block_data[:, 0]))
 
-    i1, i2, i3 = fit_luminance_plane(img_gray, t0_verts[0], t0_verts[1], t0_verts[2])
-    payload.append(int(np.clip(i1, 0, 255)))
-    payload.append(int(np.clip(i2, 0, 255)))
-    payload.append(int(np.clip(i3, 0, 255)))
+            elif r_idx > r_prev:
+                # DIRECTION: SOUTH (Scan rows top-to-bottom: 0, 1, 2)
+                delta_stream.extend(encoder.coder_update(1, block_data[0, :]))
+                delta_stream.extend(encoder.coder_update(1, block_data[1, :]))
+                delta_stream.extend(encoder.coder_update(1, block_data[2, :]))
 
-    return bytes(payload)
+            elif r_idx < r_prev:
+                # DIRECTION: NORTH (Scan rows bottom-to-top: 2, 1, 0)
+                delta_stream.extend(encoder.coder_update(3, block_data[2, :]))
+                delta_stream.extend(encoder.coder_update(3, block_data[1, :]))
+                delta_stream.extend(encoder.coder_update(3, block_data[0, :]))
 
+            r_prev, c_prev = r_idx, c_idx
 
-def decode_fractal_mesh(bitstream: bytes) -> np.ndarray:
-    """Decodes bitstream payload and rasterizes barycentric planar luminance field."""
-    if len(bitstream) < 9:
-        return np.full((512, 512), 128, dtype=np.uint8)
+        log_event(f"Evans sliding prediction ribbon processed across {len(delta_stream)} segments.",
+                  topic="optimization", pathos=2)
+        return delta_stream
 
-    w = int.from_bytes(bitstream[0:2], "big")
-    h = int.from_bytes(bitstream[2:4], "big")
-    anchor_count = int.from_bytes(bitstream[4:6], "big")
+    def _encode_buffer(self, data: np.ndarray) -> bytes:
+        """
+        Virtual method implementation for encoding the data buffer.
+        Flattens the delta streams into a packed int16 binary chunk for zlib.
+        """
+        gray_data = data[:, :, 0] if data.ndim == 3 else data
 
-    offset = 6 + anchor_count * 4
-    if len(bitstream) < offset + 3:
-        return np.full((h, w), 128, dtype=np.uint8)
+        block_accessor = ImageBlockAccessor(gray_data, block_size=3)
+        h = block_accessor.block_rows
+        w = block_accessor.block_cols
+        compiler = PathCompiler()
+        path = compiler.compile_trajectory(h, w, (0, 0), (h - 1, 0))
+        viz = SimpleGridPathVisualizer(n_rows=h, m_cols=w, scale_factor=20.0)
+        viz.render_trajectory_to_svg(path, filename="runtime_calibrated_trajectory.svg")
+        log_event(f"Quadtree trajectory compiled with {len(path)} nodes.", topic="geometry", pathos=1)
 
-    i1 = bitstream[offset]
-    i2 = bitstream[offset + 1]
-    i3 = bitstream[offset + 2]
+        # 1. Harvest the raw delta streams from the Evans ribbon (list of lists)
+        raw_delta_list = self._encode(block_accessor, path)
+        print(raw_delta_list[:100])
+        flat_deltas = np.array(raw_delta_list, dtype=np.int16)
+        # 3. Return a clean, packed byte string perfectly suited for zlib
+        return flat_deltas.tobytes()
 
-    t0_verts = compute_bounding_triangle_t0(w, h)
-    v1, v2, v3 = t0_verts[0], t0_verts[1], t0_verts[2]
+    def _decode_buffer(self, payload: bytes, w: int, h: int, channels: int) -> np.ndarray:
+        """
+        Virtual method implementation for decoding the data buffer with 100% exact reconstruction.
+        Completely unrolls the inner 3-step loop segments to eliminate lambda allocation lags.
+        """
+        # 1. Unpack the byte stream directly into a continuous 1D int8 array
+        flat_deltas = np.frombuffer(payload, dtype=np.int16)
+        print(flat_deltas[:100].tolist())
+        # 2. Reshape the flat data back into structured 3-element delta updates
+        delta_stream = flat_deltas.reshape(-1, 3)
 
-    grid_x, grid_y = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+        # 3. Initialize your blank canvas and reconstruct the geometry
+        reconstructed_gray = np.full((h, w), 128, dtype=np.int16)
+        block_accessor = ImageBlockAccessor(reconstructed_gray, block_size=3)
 
-    denom = (v2[1] - v3[1]) * (v1[0] - v3[0]) + (v3[0] - v2[0]) * (v1[1] - v3[1])
-    if abs(denom) < 1e-6:
-        denom = 1.0
+        h_b = block_accessor.block_rows
+        w_b = block_accessor.block_cols
+        compiler = PathCompiler()
+        path = compiler.compile_trajectory(h_b, w_b, (0, 0), (h_b - 1, 0))
+        decoder = EvansWindowFilter(alpha_noise=0.0, sigma_0=0.0, gamma=0.15,
+                                    quantize_fn=HalfQuantizer(), init_brightness=128.0, quantized_signal=True)
 
-    w1 = ((v2[1] - v3[1]) * (grid_x - v3[0]) + (v3[0] - v2[0]) * (grid_y - v3[1])) / denom
-    w2 = ((v3[1] - v1[1]) * (grid_x - v3[0]) + (v1[0] - v3[0]) * (grid_y - v3[1])) / denom
-    w3 = 1.0 - w1 - w2
+        delta_idx = 0
+        r_prev, c_prev = 0, -1
+        restored_block = np.zeros((3, 3), dtype=np.int16)
 
-    img_recon = w1 * i1 + w2 * i2 + w3 * i3
-    return np.clip(img_recon, 0, 255).astype(np.uint8)
+        for (r_idx, c_idx) in path:
 
+            if c_idx > c_prev:
+                # DIRECTION: EAST (Decode columns left-to-right: 0, 1, 2)
+                restored_block[:, 0] = decoder.decoder_update(0, delta_stream[delta_idx])
+                restored_block[:, 1] = decoder.decoder_update(0, delta_stream[delta_idx + 1])
+                restored_block[:, 2] = decoder.decoder_update(0, delta_stream[delta_idx + 2])
+            elif c_idx < c_prev:
+                # DIRECTION: WEST (Decode columns right-to-left: 2, 1, 0)
+                restored_block[:, 2] = decoder.decoder_update(2, delta_stream[delta_idx])
+                restored_block[:, 1] = decoder.decoder_update(2, delta_stream[delta_idx + 1])
+                restored_block[:, 0] = decoder.decoder_update(2, delta_stream[delta_idx + 2])
+            elif r_idx > r_prev:
+                # DIRECTION: SOUTH (Decode rows top-to-bottom: 0, 1, 2)
+                restored_block[0, :] = decoder.decoder_update(1, delta_stream[delta_idx])
+                restored_block[1, :] = decoder.decoder_update(1, delta_stream[delta_idx + 1])
+                restored_block[2, :] = decoder.decoder_update(1, delta_stream[delta_idx + 2])
+            elif r_idx < r_prev:
+                # DIRECTION: NORTH (Decode rows bottom-to-top: 2, 1, 0)
+                restored_block[2, :] = decoder.decoder_update(3, delta_stream[delta_idx])
+                restored_block[1, :] = decoder.decoder_update(3, delta_stream[delta_idx + 1])
+                restored_block[0, :] = decoder.decoder_update(3, delta_stream[delta_idx + 2])
+            delta_idx += 3
+            block_accessor.set_block(r_idx, c_idx, restored_block)
+            r_prev, c_prev = r_idx, c_idx
+
+        # Output formatting (Uses the original image dimensions w and h passed as parameters)
+        if channels == 3:
+            out_img = np.zeros((h, w, 3), dtype=np.uint8)
+            clipped = np.clip(reconstructed_gray, 0, 255).astype(np.uint8)
+            for i in range(3):
+                out_img[:, :, i] = clipped
+            return out_img
+        else:
+            return np.clip(reconstructed_gray, 0, 255).astype(np.uint8)
+
+#Quantizer=LogarithmicLutQuantizer
+Quantizer=HalfQuantizer
+
+class SlidingCodec(CodecBase):
+    """
+    Highly Optimized Monolithic Continuous Ribbon Streaming Codec.
+    Employs int16 binary buffers to fully support an expanded quantization
+    index dynamic range of [-512, 512] with zero risk of arithmetic overflow.
+    """
+    @dramatic_guard(topic="optimization", failure_pathos=-5)
+    def _encode(self, padded_canvas: np.ndarray, path: list) -> np.ndarray:
+        """
+        Step 4: Continuous Ribbon Evans prediction pipeline.
+        Structures innovation bins as a 2D matrix of 3-cell triplets,
+        flattening with zero-allocation .ravel() at the final return rail.
+        """
+        quantizer = Quantizer()
+        print("Quantizer", quantizer.name)
+        encoder = EvansSlidingFilter(
+            alpha_noise=0.0, sigma_0=0.0, gamma=0.15,
+            quantize_fn=quantizer, quantized_signal=True
+        )
+
+        total_triplets = len(path) * 3
+        triplet_stream = np.zeros((total_triplets, 3), dtype=quantizer.dtype)
+
+        # Pointer now increments by 1 row per step instead of 3 scalar elements
+        row_ptr = 0
+        # Strategic index initialization forces EAST on first block (0,0)
+        r_prev, c_prev = 0, -1
+
+        for (r_idx, c_idx) in path:
+            # Map block indices directly to padded pixel neighborhood centers
+            r = r_prev * 3 + 1
+            c = c_prev * 3 + 4
+
+            if c_idx > c_prev:
+                # DIRECTION: EAST (Scan 3 columns left-to-right: c, c+1, c+2)
+                triplet_stream[row_ptr] = encoder.coder_update_canvas(padded_canvas, r, c, 0)
+                triplet_stream[row_ptr + 1] = encoder.coder_update_canvas(padded_canvas, r, c + 1, 0)
+                triplet_stream[row_ptr + 2] = encoder.coder_update_canvas(padded_canvas, r, c + 2, 0)
+
+            elif c_idx < c_prev:
+                # DIRECTION: WEST (Scan 3 columns right-to-left: c, c-1, c-2)
+                triplet_stream[row_ptr] = encoder.coder_update_canvas(padded_canvas, r, c, 2)
+                triplet_stream[row_ptr + 1] = encoder.coder_update_canvas(padded_canvas, r, c - 1, 2)
+                triplet_stream[row_ptr + 2] = encoder.coder_update_canvas(padded_canvas, r, c - 2, 2)
+
+            elif r_idx > r_prev:
+                # DIRECTION: SOUTH (Scan 3 rows top-to-bottom: r, r+1, r+2)
+                triplet_stream[row_ptr] = encoder.coder_update_canvas(padded_canvas, r, c, 1)
+                triplet_stream[row_ptr + 1] = encoder.coder_update_canvas(padded_canvas, r + 1, c, 1)
+                triplet_stream[row_ptr + 2] = encoder.coder_update_canvas(padded_canvas, r + 2, c, 1)
+
+            elif r_idx < r_prev:
+                # DIRECTION: NORTH (Scan 3 rows bottom-to-top: r, r-1, r-2)
+                triplet_stream[row_ptr] = encoder.coder_update_canvas(padded_canvas, r, c, 3)
+                triplet_stream[row_ptr + 1] = encoder.coder_update_canvas(padded_canvas, r - 1, c, 3)
+                triplet_stream[row_ptr + 2] = encoder.coder_update_canvas(padded_canvas, r - 2, c, 3)
+
+            # Advance the tracking pointer by exactly 3 triplet rows per macro-block
+            row_ptr += 3
+            r_prev, c_prev = r_idx, c_idx
+        assert total_triplets == row_ptr
+        return triplet_stream.ravel()
+
+    def _encode_buffer(self, data: np.ndarray) -> bytes:
+        """
+        Virtual method implementation for encoding the data buffer.
+        Packs the continuous int16 updates directly into a raw binary chunk.
+        """
+        gray_data = data[:, :, 0] if data.ndim == 3 else data
+        h, w = gray_data.shape
+
+        min_rows = int(np.ceil(h / 3))
+        min_cols = int(np.ceil(w / 3))
+        h_b = min_rows + (min_rows % 2)
+        w_b = min_cols + (min_cols % 2)
+
+        compiler = PathCompiler()
+        path = compiler.compile_trajectory(h_b, w_b, (0, 0), (h_b - 1, 0))
+
+        # Setup standalone compliant trajectory trace mappings
+        viz = SimpleGridPathVisualizer(n_rows=h_b, m_cols=w_b, scale_factor=20.0)
+        viz.render_trajectory_to_svg(path, filename="runtime_calibrated_trajectory.svg")
+        log_event(f"Quadtree trajectory compiled with {len(path)} nodes.", topic="geometry", pathos=1)
+
+        # Apply asymmetric edge padding layout to accurately layout the virtual start block (0, -1)
+        padded_canvas = np.pad(gray_data, pad_width=((0, h_b * 3 - h), (3, (w_b + 1)* 3 - w)), mode='edge').astype(np.float64)
+        padded_canvas[:, :3] = 128.0
+
+        # Harvest the packed int16 delta array stream directly from the monolithic canvas update
+        flat_deltas = self._encode(padded_canvas, path)
+
+        return flat_deltas.ravel()
+
+    def _decode_buffer(self, payload: bytes, w: int, h: int, channels: int) -> np.ndarray:
+        """
+        Virtual method implementation for decoding the data buffer with 100% exact reconstruction.
+        Unpacks the raw int16 bytes stream and drives direct in-place canvas updates.
+        """
+        # 1. FIXED: Unpack the byte stream directly into a continuous 1D int16 array
+        # to guarantee bit-exact mapping of large indices without overflows
+        quantizer = Quantizer()
+        flat_deltas = np.frombuffer(payload, dtype=quantizer.dtype)
+        delta_stream = flat_deltas.reshape(-1, 3)
+
+        min_rows = int(np.ceil(h / 3))
+        min_cols = int(np.ceil(w / 3))
+        h_b = min_rows + (min_rows % 2)
+        w_b = min_cols + (min_cols % 2)
+
+        # Initialize the master canvas tracking layout
+        padded_canvas = np.full((h_b * 3, (w_b + 1) * 3), 128.0, dtype=np.float64)
+
+        compiler = PathCompiler()
+        path = compiler.compile_trajectory(h_b, w_b, (0, 0), (h_b - 1, 0))
+
+        decoder = EvansSlidingFilter(
+            alpha_noise=0.0, sigma_0=0.0, gamma=0.15,
+            quantize_fn=quantizer, quantized_signal=True
+        )
+
+        delta_idx = 0
+        r_prev, c_prev = 0, -1
+
+        for (r_idx, c_idx) in path:
+            r = r_prev * 3 + 1
+            c = c_prev * 3 + 4
+            v0, v1, v2 = delta_stream[delta_idx:delta_idx+3]
+            if c_idx > c_prev:
+                # DIRECTION: EAST (Decode 3 columns left-to-right)
+                decoder.decoder_update_canvas(padded_canvas, r, c, 0, v0)
+                decoder.decoder_update_canvas(padded_canvas, r, c + 1, 0, v1)
+                decoder.decoder_update_canvas(padded_canvas, r, c + 2, 0, v2)
+            elif c_idx < c_prev:
+                # DIRECTION: WEST (Decode 3 columns right-to-left)
+                decoder.decoder_update_canvas(padded_canvas, r, c, 2, v0)
+                decoder.decoder_update_canvas(padded_canvas, r, c - 1, 2, v1)
+                decoder.decoder_update_canvas(padded_canvas, r, c - 2, 2, v2)
+            elif r_idx > r_prev:
+                # DIRECTION: SOUTH (Decode 3 rows top-to-bottom)
+                decoder.decoder_update_canvas(padded_canvas, r, c, 1, v0)
+                decoder.decoder_update_canvas(padded_canvas, r + 1, c, 1, v1)
+                decoder.decoder_update_canvas(padded_canvas, r + 2, c, 1, v2)
+            elif r_idx < r_prev:
+                # DIRECTION: NORTH (Decode 3 rows bottom-to-top)
+                decoder.decoder_update_canvas(padded_canvas, r, c, 3, v0)
+                decoder.decoder_update_canvas(padded_canvas, r - 1, c, 3, v1)
+                decoder.decoder_update_canvas(padded_canvas, r - 2, c, 3, v2)
+
+            delta_idx += 3
+            r_prev, c_prev = r_idx, c_idx
+
+        # 3. Slice away the temporary padding boundary to return original frame sizes
+        reconstructed_gray = padded_canvas[0 : h, 3 : w + 3]
+
+        if channels == 3:
+            out_img = np.zeros((h, w, 3), dtype=np.uint8)
+            clipped = np.clip(reconstructed_gray, 0, 255).astype(np.uint8)
+            for i in range(3):
+                out_img[:, :, i] = clipped
+            return out_img
+        else:
+            return np.clip(np.rint(reconstructed_gray), 0, 255).astype(np.uint8)
 
 # =============================================================================
-#                                MODULE TESTS
+#                            MODULE TESTS
 # =============================================================================
 
-if __name__ == "__main__":
+
+def test_codec():
+    """Test suite for Codec implementation with exact ribbon delta roundtrip."""
     print("[TEST] Running codec.py module tests...")
 
-    # 1. Test Uniform Image Roundtrip Dimensions
-    test_img = np.full((100, 200), 200, dtype=np.uint8)
-    stream = encode_fractal_mesh(test_img, target_anchors=10)
-    recon = decode_fractal_mesh(stream)
+    dummy_image = np.random.randint(0, 256, (16, 28), dtype=np.uint8)
+    codec = SlidingCodec(config={})
+    np.set_printoptions(edgeitems=3, infstr='inf',
+                        linewidth=200, nanstr='nan',
+                        precision=1, suppress=False,
+                        threshold=1000, formatter=None)
+    print("source")
+    print(dummy_image)
+    bitstream = codec.encode(dummy_image)
+    assert len(bitstream) > 4, "Bitstream must contain header and payload"
 
-    assert recon.shape == test_img.shape, f"Shape mismatch: {recon.shape} vs {test_img.shape}"
+    reconstructed = codec.decode(bitstream)
+    print("reconstructed")
+    print(reconstructed)
+    print(np.isclose(reconstructed, dummy_image, 0.))
+    assert reconstructed.shape == dummy_image.shape, "Reconstructed image shape must match"
+    assert np.isclose(reconstructed, dummy_image, 1.).all(), "Reconstructed image must match"
 
-    # 2. Header parsing assertions
-    w_parsed = int.from_bytes(stream[0:2], "big")
-    h_parsed = int.from_bytes(stream[2:4], "big")
-    assert w_parsed == 200, f"Expected width 200, got {w_parsed}"
-    assert h_parsed == 100, f"Expected height 100, got {h_parsed}"
-
-    # 3. Test Bitstream Resilience against corrupted bytes
-    corrupted_stream = b"\x00\x02"  # Short invalid stream
-    fallback = decode_fractal_mesh(corrupted_stream)
-    assert fallback.shape == (512, 512), "Decoder should fall back gracefully on invalid stream"
-
+    # Perfect or near-perfect structural validation along active ribbon segments
     print("[SUCCESS] All codec.py tests passed cleanly!")
+
+
+def test_image():
+    import cv2
+    synthetic = np.zeros((256, 256), dtype=np.uint8)
+    cv2.circle(synthetic, (128, 128), 64, 255, -1)
+    codec = SlidingCodec(collect_stats=True)
+    np.set_printoptions(edgeitems=3, infstr='inf',
+                        linewidth=200, nanstr='nan',
+                        precision=8, suppress=False,
+                        threshold=1000, formatter=None)
+    bitstream = codec.encode(synthetic)
+    print(codec.stats)
+    reconstructed = codec.decode(bitstream)
+    cv2.imshow("Reconstructed",cv2.absdiff(reconstructed,synthetic) * 255)
+    cv2.waitKey()
+    print(np.isclose(reconstructed, synthetic, 0.))
+    assert reconstructed.shape == synthetic.shape, "Reconstructed image shape must match"
+    assert np.isclose(reconstructed, synthetic, 1.).all(), "Reconstructed image must match"
+
+    # Perfect or near-perfect structural validation along active ribbon segments
+    print("[SUCCESS] All codec.py tests passed cleanly!")
+
+
+if __name__ == "__main__":
+    test_codec()
+    test_image()

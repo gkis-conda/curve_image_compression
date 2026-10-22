@@ -28,12 +28,50 @@ from dramatic_logger import log_event
 # DYNAMIC IMPLEMENTATION IMPORT FROM CODEC MODULE
 # -----------------------------------------------------------------------------
 try:
-    from codec import Codec
+    from codec import SlidingCodec
+    Codec = SlidingCodec
 except ImportError:
     try:
         from codec_stub import Codec
     except ImportError:
         Codec = None
+
+import matplotlib.pyplot as plt
+
+import matplotlib.pyplot as plt
+
+
+def save_residuals_histogram(stats: dict, filename: str = "residuals_histogram.png") -> None:
+    """
+    Saves the residuals histogram plot to a file based on codec statistics.
+    """
+    hist_data = stats.get("residuals_histogram", {})
+    counts = hist_data.get("counts", [])
+    bins = hist_data.get("bins", [])
+
+    if not counts or not bins:
+        print("[WARNING] Histogram data missing in stats.")
+        return
+
+    # Compute bin centers and widths for plotting bars
+    bin_centers = [(bins[i] + bins[i + 1]) / 2 for i in range(len(counts))]
+    bin_widths = [bins[i + 1] - bins[i] for i in range(len(counts))]
+
+    plt.figure(figsize=(10, 6))
+    plt.bar(bin_centers, counts, width=bin_widths, edgecolor='black', alpha=0.8, color='#1f77b4')
+
+    # Logarithmic scale helps visualize massive peaks near zero alongside rare tails
+    plt.yscale('log')
+
+    plt.title('Residuals Distribution Histogram', fontsize=14, fontweight='bold')
+    plt.xlabel('Residual Value', fontsize=12)
+    plt.ylabel('Pixel Count (Log Scale)', fontsize=12)
+    plt.grid(True, which="both", ls="--", alpha=0.5)
+    plt.tight_layout()
+
+    plt.savefig(filename, dpi=300)
+    plt.close()
+    print(f"[SUCCESS] Histogram plot saved to {filename}")
 
 
 def calculate_psnr(original: np.ndarray, reconstructed: np.ndarray) -> float:
@@ -113,11 +151,7 @@ def run_benchmark(image_path: str):
     raw_size_bytes = img_orig.nbytes
 
     # Define codec tuning configuration bundle for constructor
-    codec_config = {
-        "target_anchors": 300,
-        "tolerance": 0.01,
-        "r_l1": 2
-    }
+    codec_config = {"collect_stats":True, "bins":255}
     
     # Instantiate the codec with configuration parameters
     codec = Codec(**codec_config)
@@ -129,11 +163,11 @@ def run_benchmark(image_path: str):
         pathos=1,
     )
 
-    # Encode domain surface into fractal stream using codec instance
+    # Encode domain surface into stream using codec instance
     t0 = time.perf_counter()
     bitstream = codec.encode(img_orig)
     t_enc = (time.perf_counter() - t0) * 1000.0
-
+    print(codec.stats)
     compressed_size_bytes = len(bitstream)
     bpp = (compressed_size_bytes * 8.0) / (w * h)
     compression_ratio = (
@@ -149,6 +183,7 @@ def run_benchmark(image_path: str):
     psnr_val = calculate_psnr(img_orig, img_recon)
     ssim_val = calculate_ssim(img_orig, img_recon)
     pathos_val = psnr_and_ssim_to_pathos(psnr_val, ssim_val)
+    save_residuals_histogram(codec.stats)
 
     log_event(
         f"Compression Completed: {compressed_size_bytes} B ({compressed_size_bytes / 1024.0:.2f} KB) | "

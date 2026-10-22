@@ -26,73 +26,87 @@ class SimpleGridPathVisualizer:
         y = r * self.scale + self.scale / 2.0 + self.pad
         return x, y
 
-    def render_trajectory_to_svg(self, path_list, filename="custom_snake_path.svg"):
+    # Centered style configuration block (Can be moved to class level or config files)
+    # Простой и понятный блок конфигурации презентации
+    STYLE_CONFIG = {
+        "grid_line_stroke": "#333344",
+        "grid_line_width": "1",
+        "path_line_stroke": "#00ff66",
+        "path_line_width": "3",
+        "node_dot_fill": "#00aa44",
+        "start_node_fill": "#ffff00",
+        "end_node_fill": "#ff3333",
+        "background": '#888888'
+    }
+
+    def render_trajectory_to_svg(self, path_list, filename="custom_snake_path.svg", styles=None):
         """
-        Builds the gray grid backdrop, draws the custom path line through 
-        the centers, and saves the standalone compliant XML dataset.
+        BALANCED HIGH-SPEED SVG GENERATOR:
+        Leverages parent <g> grouping tags for colors (stroke/fill) to avoid repetition,
+        while maintaining standard geometric 'r' parameters explicitly inside the circle tags.
         """
+        if not path_list:
+            print("[WARNING] Path list is empty. SVG rendering skipped.")
+            return
+
+        cfg = styles if styles is not None else self.STYLE_CONFIG
+
+        # --- 1. SINGLE-PASS COORDINATE PRE-COMPUTATION ---
+        computed_centers = [self._get_cell_center_pixel(r, c) for r, c in path_list]
+
+        # --- 2. HEADER AND BACKDROP INITIALIZATION ---
         svg_lines = [
-            '<svg width="{}" height="{}" viewBox="0 0 {} {}" xmlns="http://www.w3.org/2000/svg" style="background:#888888;">'.format(
-                self.w_canvas, self.h_canvas, self.w_canvas, self.h_canvas
+            '<svg width="{}" height="{}" viewBox="0 0 {} {}" xmlns="http://www.w3.org/2000/svg" style="background:{};">'.format(
+                self.w_canvas, self.h_canvas, self.w_canvas, self.h_canvas, cfg["background"]
             )
         ]
 
-        # 1. Structural Layer: Render gray grid lines bounding the cells
-        # Vertical grid line splitters
-        for c in range(self.m_cols + 1):
-            x = c * self.scale + self.pad
-            y1 = self.pad
-            y2 = self.n_rows * self.scale + self.pad
-            svg_lines.append(
-                '<line x1="{}" y1="{}" x2="{}" y2="{}" stroke="#333344" stroke-width="1"/>'.format(x, y1, x, y2)
-            )
-            
-        # Horizontal grid line splitters
-        for r in range(self.n_rows + 1):
-            y = r * self.scale + self.pad
-            x1 = self.pad
-            x2 = self.m_cols * self.scale + self.pad
-            svg_lines.append(
-                '<line x1="{}" y1="{}" x2="{}" y2="{}" stroke="#333344" stroke-width="1"/>'.format(x1, y, x2, y)
-            )
+        # --- 3. GRID BACKDROP LAYER (Parent-Group Inheritance for strokes) ---
+        svg_lines.append('<g stroke="{}" stroke-width="{}">'.format(cfg["grid_line_stroke"], cfg["grid_line_width"]))
 
-        # 2. Path Layer: Render the sequential trajectory trail polyline
-        formatted_centers = []
-        for r, c in path_list:
-            cx, cy = self._get_cell_center_pixel(r, c)
-            formatted_centers.append("{},{}".format(cx, cy))
-            
-        polyline_pts_str = " ".join(formatted_centers)
+        y_min, y_max = self.pad, self.n_rows * self.scale + self.pad
+        for c in range(self.m_cols + 1):
+            x = int(c * self.scale + self.pad)
+            svg_lines.append('  <line x1="{}" y1="{}" x2="{}" y2="{}"/>'.format(x, y_min, x, y_max))
+
+        x_min, x_max = self.pad, self.m_cols * self.scale + self.pad
+        for r in range(self.n_rows + 1):
+            y = int(r * self.scale + self.pad)
+            svg_lines.append('  <line x1="{}" y1="{}" x2="{}" y2="{}"/>'.format(x_min, y, x_max, y))
+
+        svg_lines.append('</g>')
+
+        # --- 4. TRAJECTORY PATH LAYER ---
+        polyline_pts_str = " ".join("{},{}".format(int(cx), int(cy)) for cx, cy in computed_centers)
         svg_lines.append(
-            '<polyline points="{}" fill="none" stroke="#00ff66" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>'.format(
-                polyline_pts_str
+            '<polyline points="{}" fill="none" stroke="{}" stroke-width="{}" stroke-linecap="round" stroke-linejoin="round"/>'.format(
+                polyline_pts_str, cfg["path_line_stroke"], cfg["path_line_width"]
             )
         )
 
-        # 3. Node Center Indicators: Overlay dots on every visited cell center
-        for r, c in path_list:
-            cx, cy = self._get_cell_center_pixel(r, c)
-            svg_lines.append(
-                '<circle cx="{}" cy="{}" r="3" fill="#00aa44"/>'.format(cx, cy)
-            )
+        # --- 5. NODE INDICATORS LAYER (Group fill color inheritance + Explicit radius) ---
+        #svg_lines.append('<g fill="{}">'.format(cfg["node_dot_fill"]))
+        #svg_lines.extend(
+        #    '  <circle cx="{}" cy="{}" r="3"/>'.format(cx, cy)
+        #    for cx, cy in computed_centers
+        #)
+        #svg_lines.append('</g>')
 
-        # 4. Critical Waypoints: Highlighting explicit Start and End anchors
-        if path_list:
-            sx, sy = self._get_cell_center_pixel(path_list[0][0], path_list[0][1])
-            ex, ey = self._get_cell_center_pixel(path_list[-1][0], path_list[-1][1])
-            
-            # Start Node (Glowing Yellow)
-            svg_lines.append('<circle cx="{}" cy="{}" r="6" fill="#ffff00" stroke="#fff" stroke-width="1"/>'.format(sx, sy))
-            # End Node (Glowing Red)
-            svg_lines.append('<circle cx="{}" cy="{}" r="6" fill="#ff3333" stroke="#fff" stroke-width="1"/>'.format(ex, ey))
+        # --- 6. CRITICAL WAYPOINTS (START / END CORNER ANCHORS) ---
+        sx, sy = computed_centers[0]
+        svg_lines.append('<circle cx="{}" cy="{}" r="6" fill="{}" stroke="#ffffff" stroke-width="1"/>'.
+                         format(sx, sy,cfg["start_node_fill"]))
+        ex, ey = computed_centers[-1]
+        svg_lines.append('<circle cx="{}" cy="{}" r="6" fill="{}" stroke="#ffffff" stroke-width="1"/>'.
+                         format(ex, ey, cfg["end_node_fill"]))
 
         svg_lines.append('</svg>')
-        
-        # Write output to disk
+
+        # --- 7. DISK SERIALIZATION PASS ---
         with open(filename, "w") as f:
             f.write("\n".join(svg_lines))
-            
-        print("[SUCCESS] Grid map and custom path rendered to: {}".format(filename))
+
+        print("[SUCCESS] Stable grid map and custom trajectory path rendered to: {}".format(filename))
 
 
 # =============================================================================

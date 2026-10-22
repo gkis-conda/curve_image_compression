@@ -114,28 +114,28 @@ class PathCompiler:
         """
 
         def _quad_split(H, W, s, t, deep=0):
-            print("\t" * deep, f"[{H}x{W}]", s, t)
+            #print("\t" * deep, f"[{H}x{W}]", s, t)
             # ==================================================
             # Reduces all 4 P-shape orientations to canonical U-shape
             # ==================================================
             s_r, s_c = s
             t_r, t_c = t
             if s_r == H - 1 and t_r == H - 1:
-                print("\t" * deep, 'V:')
+                #print("\t" * deep, 'V:')
                 s_flipped = (0, s_c)
                 t_flipped = (0, t_c)
                 flipped_path = _quad_split(H, W, s_flipped, t_flipped, deep)
                 return [(H - 1 - r, c) for r, c in flipped_path]
             # 2. AXIS TRANSPOSE (Turn 90 degrees if entry/exit are on a vertical edge)
             if s_c == t_c:
-                print("\t" * deep, 'T:')
+                #print("\t" * deep, 'T:')
                 s_transposed = (s_c, s_r)
                 t_transposed = (t_c, t_r)
                 transposed_path = _quad_split(W, H, s_transposed, t_transposed, deep)
                 # Reverse mapping: swap rows and columns back
                 return [(c, r) for r, c in transposed_path]
             if s_c > t_c:
-                print("\t" * deep, 'M:')
+                #print("\t" * deep, 'M:')
                 s_mirrored = (s_r, W - 1 - s_c)
                 t_mirrored = (t_r, W - 1 - t_c)
                 mirrored_path = _quad_split(H, W, s_mirrored, t_mirrored, deep)
