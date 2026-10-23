@@ -6,33 +6,35 @@ class BitWriter:
 
     def __init__(self):
         self.buffer = bytearray()
-        self.current_byte = 0
+        self.current_byte = np.int64(0)
         self.bit_count = 0
 
-    def write_bit(self, bit: int):
-        self.current_byte = (self.current_byte << 1) | (bit & 1)
-        self.bit_count += 1
-        if self.bit_count == 8:
-            self.buffer.append(self.current_byte)
-            self.current_byte = 0
-            self.bit_count = 0
-
     def write_bits(self, val: int, num_bits: int):
-        for i in range(num_bits - 1, -1, -1):
-            self.write_bit((val >> i) & 1)
+        #assert num_bits <= 32
+        #assert val >= 0
+        if num_bits <= 0:
+            return
+
+        self.current_byte = (val << self.bit_count) | self.current_byte
+        #assert self.current_byte >= 0
+        self.bit_count += num_bits
+
+        while self.bit_count >= 8:
+            self.buffer.append(self.current_byte & 0xFF)
+            self.current_byte >>= 8
+            self.bit_count -= 8
 
     def flush(self) -> tuple:
         total_bits = len(self.buffer) * 8 + self.bit_count
         if self.bit_count > 0:
-            self.current_byte <<= (8 - self.bit_count)
-            self.buffer.append(self.current_byte)
-            self.current_byte = 0
-            self.bit_count = 0
+            padding_bits = 8 - self.bit_count
+            self.write_bits(0, padding_bits)
+
         return bytes(self.buffer), total_bits
 
 
 class BitReader:
-    """High-performance bit reader using a 32-bit integer buffer (MSB first)."""
+    """High-performance bit reader using a 32-bit integer buffer (Little-Endian / LSB first)."""
 
     def __init__(self, data: bytes):
         self.data = data
@@ -41,63 +43,56 @@ class BitReader:
         self.bits_left = 0
         self.length = len(data)
 
-    def _refill(self) -> None:
-        """Loads bytes into the 32-bit buffer while there is space and data."""
-        while self.bits_left <= 24 and self.byte_idx < self.length:
-            self.bit_buffer = (self.bit_buffer << 8) | self.data[self.byte_idx]
-            self.bits_left += 8
-            self.byte_idx += 1
+    def has_bits(self) -> bool:
+        """Returns True if there are bits left in the buffer or unread bytes in data."""
+        return self.bits_left > 0 or self.byte_idx < self.length
 
     def read_bits(self, num_bits: int) -> int:
-        """Reads a fixed number of bits from the buffer."""
+        """Reads a fixed number of bits from the lower part of the buffer."""
         if num_bits == 0:
             return 0
 
         while self.bits_left < num_bits:
             if self.byte_idx >= self.length:
                 raise IndexError("End of bit stream reached.")
-            self.bit_buffer = (self.bit_buffer << 8) | self.data[self.byte_idx]
+            self.bit_buffer |= self.data[self.byte_idx] << self.bits_left
             self.bits_left += 8
             self.byte_idx += 1
 
+        # Extract the lowest bits
+        val = self.bit_buffer & ((1 << num_bits) - 1)
+        self.bit_buffer >>= num_bits
         self.bits_left -= num_bits
-        val = (self.bit_buffer >> self.bits_left) & ((1 << num_bits) - 1)
         return val
 
     def count_zeros(self) -> int:
-        """
-        Reads unary code (q zeros followed by '1') instantly
-        using 32-bit buffer and native bit_length() (O(1) time).
-        """
+        """Reads unary code (q zeros followed by '1') instantly in Little-Endian."""
         q = 0
-        while True:
-            # Ensure we have enough bits loaded in the buffer
-            if self.bits_left < 8:
-                self._refill()
+        while self.has_bits():
+            if self.bits_left > 0:
+                mask = (1 << self.bits_left) - 1
+                valid_bits = self.bit_buffer & mask
 
-            if self.bits_left == 0:
-                raise IndexError("End of bit stream reached.")
+                if valid_bits != 0:
+                    lowest_bit = valid_bits & -valid_bits
+                    leading_zeros = lowest_bit.bit_length() - 1
+                    q += leading_zeros
 
-            # Mask current available bits in the buffer
-            mask = (1 << self.bits_left) - 1
-            valid_bits = self.bit_buffer & mask
+                    consumed = leading_zeros + 1
+                    self.bit_buffer >>= consumed
+                    self.bits_left -= consumed
+                    return q
 
-            # If all available bits in the buffer are zero, consume them all and add to q
-            if valid_bits == 0:
                 q += self.bits_left
-                self.bit_buffer = 0
                 self.bits_left = 0
-                continue
+                self.bit_buffer = 0
 
-            # Fast leading zeros calculation using native C-optimized bit_length()
-            # Distance from bits_left to bit_length gives exact number of leading zeros (q)
-            leading_zeros = self.bits_left - valid_bits.bit_length()
-            q += leading_zeros
+            bytes_to_read = min(4, self.length - self.byte_idx)
+            self.bit_buffer = int.from_bytes(self.data[self.byte_idx: self.byte_idx + bytes_to_read], byteorder='little')
+            self.bits_left = bytes_to_read * 8
+            self.byte_idx += bytes_to_read
 
-            # Consume the zeros and the terminating '1' bit
-            consumed = leading_zeros + 1
-            self.bits_left -= consumed
-            return q
+        return -1
 
 
 class GolombRiceCodec:
@@ -134,6 +129,11 @@ class GolombRiceCodec:
             M: Rice parameter (chunk size 2^M).
             signed: If True, encodes +/- values by interleaving them into non-negative range.
         """
+        if 0 == k:
+            encoded_bytes = values.tobytes()
+            total_bits = len(encoded_bytes) * 8
+            return encoded_bytes, total_bits
+
         if signed:
             unsigned_vals = cls._signed_to_unsigned(values)
         else:
@@ -146,7 +146,11 @@ class GolombRiceCodec:
         r_vals = unsigned_vals & (divisor - 1)  # Remainder
         # Unary encoding of quotient q: q zeros followed by '1'
         for q,r in zip(q_vals,r_vals):
-            writer.write_bits(1, q+1)
+            while q >= 23:
+                # Write 31 zeros (we write 0 with length 31)
+                writer.write_bits(0, 23)
+                q -= 23
+            writer.write_bits(1<<q, q+1)
             # Fixed-length binary encoding of remainder r
             writer.write_bits(r, k)
 
@@ -164,14 +168,15 @@ class GolombRiceCodec:
             optimal_m_float = mean_abs * 0.693147
             k = int(np.round(np.log2(optimal_m_float)))
         else:
-            k = -1
+            k = 0
 
-        if 0 < k < 4:
-            encoded_bytes, total_bits = GolombRiceCodec.encode_stream(residuals, k=k, signed=is_signed)
-        else:
-            encoded_bytes = residuals.tobytes()
-            total_bits = len(encoded_bytes) * 8
+        if k > 0:
+            b = 1 + k + (2 if is_signed else 1) * mean_abs / (1 << k)
+            b0 = residuals.itemsize * 8
+            if b > b0:
+                k = 0
 
+        encoded_bytes, total_bits = GolombRiceCodec.encode_stream(residuals, k=k, signed=is_signed)
         return encoded_bytes, total_bits, k
 
     @classmethod
@@ -180,23 +185,19 @@ class GolombRiceCodec:
         Unpacks and decodes a Golomb-Rice bit stream back into integers
         dynamically until the end of the buffer is reached.
         """
-
-        if not (0 < k < 4):
+        if 0 == k:
             return np.frombuffer(encoded_bytes, dtype=res_dtype)
 
         reader = BitReader(encoded_bytes)
         unsigned_vals = []
         while True:
-            try:
-                # 1. Read unary quotient q (count leading zeros until '1')
-                q = reader.count_zeros()
-                # 2. Read M bits for remainder r
-                r = reader.read_bits(k)
-                # 3. Reconstruct value: val = q * 2^M + r
-                val = (q << k) + r
-                unsigned_vals.append(val)
-            except IndexError:
+            q = reader.count_zeros()
+            if q == -1:
                 break
+            r = reader.read_bits(k)
+            # Reconstruct value: val = q * 2^M + r
+            val = (q << k) + r
+            unsigned_vals.append(val)
 
         if np.issubdtype(res_dtype, np.signedinteger):
             res = cls._unsigned_to_signed(unsigned_vals)
@@ -215,7 +216,7 @@ def run_codec_tests():
     print("=" * 60)
 
     np.random.seed(42)
-    sample_size = 10000
+    sample_size = 10003
     loc, scale = 0.0, 3.5
 
     raw_samples = laplace.rvs(loc=loc, scale=scale, size=sample_size)
@@ -266,5 +267,50 @@ def run_codec_tests():
     print("=" * 60)
 
 
+def test_bitstream():
+    print("--- START BITSTREAM CODEC TEST ---")
+
+    test_data = [
+        (5, 3, 'fixed'),  # 0b101
+        (1, 1, 'fixed'),  # 0b1
+        (4, 4, 'unary'),  # 4 zeros + 1 one (write_bits(1, 5) -> 0b00001)
+        (12, 4, 'fixed'),  # 0b1100
+        (3, 3, 'unary'),  # 3 zeros + 1 one (write_bits(1, 4) -> 0b0001)
+        (1023, 10, 'fixed'),  # Max for 10 bits
+        (0, 1, 'fixed'),  # 0b0
+    ]
+
+    writer = BitWriter()
+
+    # 1. Encoding phase
+    for val, bits, t_type in test_data:
+        if t_type == 'fixed':
+            writer.write_bits(val, bits)
+        elif t_type == 'unary':
+            writer.write_bits(1<<bits, bits + 1)
+
+    encoded_bytes, total_bits = writer.flush()
+    print(f"Encoded bytes: {len(encoded_bytes)}, Total useful bits: {total_bits}")
+    print(f"Hex dump: {encoded_bytes.hex()}")
+
+    # 2. Decoding phase & validation
+    reader = BitReader(encoded_bytes)
+
+    for i, (orig_val, bits, t_type) in enumerate(test_data):
+        if t_type == 'fixed':
+            decoded_val = reader.read_bits(bits)
+            assert decoded_val == orig_val, f"Error at step {i}: expected {orig_val}, got {decoded_val}"
+            print(f"Step {i} (Fixed): Read {decoded_val} ({bits} bits)")
+
+        elif t_type == 'unary':
+            decoded_val = reader.count_zeros()
+            assert decoded_val == orig_val, f"Error at step {i} (Unary): expected {orig_val}, got {decoded_val}"
+            print(f"Step {i} (Unary): Found {decoded_val} zeros")
+
+    assert reader.count_zeros() == -1
+    print("\n[SUCCESS] All data recovered with 100% precision!")
+
+
 if __name__ == "__main__":
+    test_bitstream()
     run_codec_tests()

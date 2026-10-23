@@ -86,7 +86,6 @@ class CodecBase:
 
             self.stats = {
                 "total_symbols": num_symbols,
-                "golomb_rice_bits": total_bits,
                 "bits_per_symbol": total_bits / max(1, num_symbols),
                 "original_bytes": original_bytes,
                 "compressed_payload_bytes": len(compressed_payload_bytes),
@@ -129,7 +128,6 @@ class CodecBase:
         h = self.config.get("h")
         channels = self.config.get("channels", 1)
 
-
         raw_payload_bytes = zlib.decompress(compressed_payload_bytes)
 
         res_dtype = np.dtype(self.config.get("residuals_dtype", "int16"))
@@ -146,7 +144,7 @@ class Codec(CodecBase):
         """
         return data.ravel()
 
-    def _decode_buffer(self, payload: bytes, w: int, h: int, channels: int) -> np.ndarray:
+    def _decode_buffer(self, payload: np.ndarray, w: int, h: int, channels: int) -> np.ndarray:
         """
         Virtual method for decoding the data buffer.
         Subclasses can override this to reconstruct data from custom bitstreams.

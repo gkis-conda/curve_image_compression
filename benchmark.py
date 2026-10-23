@@ -38,8 +38,6 @@ except ImportError:
 
 import matplotlib.pyplot as plt
 
-import matplotlib.pyplot as plt
-
 
 def save_residuals_histogram(stats: dict, filename: str = "residuals_histogram.png") -> None:
     """
