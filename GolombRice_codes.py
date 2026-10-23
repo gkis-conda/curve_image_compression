@@ -33,6 +33,46 @@ class BitWriter:
         return bytes(self.buffer), total_bits
 
 
+from numba import njit, uint32, int32
+
+@njit
+def fast_encode_loop(q_vals, r_vals, k):
+    buffer = np.zeros(len(q_vals) * 4, dtype=np.uint8)
+    byte_idx = 0
+    current_byte = np.uint64(0)
+    bit_count = 0
+
+    for i in range(len(q_vals)):
+        q = np.uint64(q_vals[i])
+        r = np.uint64(r_vals[i])
+
+        while q >= 23:
+            bit_count += 23
+            while bit_count >= 8:
+                buffer[byte_idx] = current_byte & 0xFF
+                byte_idx += 1
+                current_byte >>= 8
+                bit_count -= 8
+            q -= np.uint64(23)
+
+        combined_code = (np.uint64(1) | r << 1) << q
+        code_len = q + 1 + k
+        current_byte |= (combined_code << bit_count)
+        bit_count += code_len
+
+        while bit_count >= 8:
+            buffer[byte_idx] = current_byte & 0xFF
+            byte_idx += 1
+            current_byte >>= 8
+            bit_count -= 8
+
+    if bit_count > 0:
+        buffer[byte_idx] = current_byte & 0xFF
+        byte_idx += 1
+
+    return buffer[:byte_idx], len(buffer[:byte_idx]) * 8 + bit_count
+
+
 class BitReader:
     """High-performance bit reader using a 32-bit integer buffer (Little-Endian / LSB first)."""
 
@@ -74,7 +114,7 @@ class BitReader:
                 valid_bits = self.bit_buffer & mask
 
                 if valid_bits != 0:
-                    lowest_bit = valid_bits & -valid_bits
+                    lowest_bit = int(valid_bits & -valid_bits)
                     leading_zeros = lowest_bit.bit_length() - 1
                     q += leading_zeros
 
@@ -139,11 +179,14 @@ class GolombRiceCodec:
         else:
             unsigned_vals = values
 
-        writer = BitWriter()
         divisor = 1 << k
 
         q_vals = unsigned_vals >> k  # Quotient
         r_vals = unsigned_vals & (divisor - 1)  # Remainder
+
+        return fast_encode_loop(q_vals, r_vals, k)
+
+        writer = BitWriter()
         # Unary encoding of quotient q: q zeros followed by '1'
         for q,r in zip(q_vals,r_vals):
             while q >= 23:
@@ -204,8 +247,6 @@ class GolombRiceCodec:
         else:
             res = unsigned_vals
         return  np.array(res, dtype=res_dtype)
-
-
 
 from scipy.stats import laplace
 
