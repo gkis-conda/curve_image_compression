@@ -15,7 +15,32 @@
 import json
 import zlib
 import numpy as np
-from GolombRice_codes import GolombRiceCodec
+from GolombRice_codes import GolombRiceCodec, ExpGolombCodec
+from residuals_splitter import ResidualSplitter, UniformTailEstimator
+
+
+def encode_stream(residuals: np.ndarray, config: dict) -> tuple:
+    """
+    Factory function: selects and executes the optimal entropy coder
+    based on the configuration profile produced by the UniformTailEstimator.
+    """
+    recommended_coder = config.get("recommended_coder", "ExpGolomb")
+
+    if recommended_coder == "GolombRice":
+        k = config.get("golomb_k", 0)
+        encoded_bytes = GolombRiceCodec.encode_stream(residuals, k=k)
+        total_bits = len(residuals) * (k + 1)
+        return encoded_bytes, total_bits, k
+
+    elif recommended_coder == "ExpGolomb":
+        k = config.get("core_k", 2)
+        return ExpGolombCodec.encode_stream(residuals, k=k)
+    elif recommended_coder == "Raw":
+        encoded_bytes = residuals.tobytes()
+        total_bits = residuals.nbytes * 8
+        return encoded_bytes, total_bits, 0
+    else:
+        raise Exception("Unknown codec")
 
 
 class CodecBase:
@@ -42,7 +67,8 @@ class CodecBase:
     def encode(self, img_data: np.ndarray) -> bytes:
         """
         Template method: extracts dimensions and channels, serializes config,
-        invokes buffer encoder, applies Golomb-Rice and zlib compression.
+        invokes buffer encoder, applies EM-based UniformTailEstimator ('microscope'),
+        and routes through the optimal entropy compression path.
         """
         if not isinstance(img_data, np.ndarray):
             img_data = np.array(img_data, dtype=np.uint8)
@@ -61,9 +87,55 @@ class CodecBase:
         residuals = self._encode_buffer(img_data)
         self.config["residuals_dtype"] = str(residuals.dtype)
 
-        # Automatically detect if residuals are signed or unsigned
-        encoded_bytes, total_bits, k = GolombRiceCodec.encode_adaptive(residuals)
-        self.config["rice_k"] = k
+        # 2. Use our Microscope (UniformTailEstimator) to analyze residuals distribution
+        threshold = self.config.get("splitter_threshold", -1)
+
+        if threshold <= 0:
+            # Instantiate and run the EM-based MLE estimator
+            estimator = UniformTailEstimator(tail_min=self.config.get("tail_min", 32))
+            estimator.fit(residuals)
+            threshold = estimator.threshold
+            self.config["splitter_threshold"] = threshold
+            factory_config = estimator.get_codec_factory_config()
+            self.config.update(factory_config)
+
+        # Check if splitting should be active (threshold > 0 and distribution calls for a mixture tail)
+        use_splitter = threshold > 0 and self.config.get("distribution_type", "mixture_tail") == "mixture_tail"
+        self.config["use_splitter"] = use_splitter
+
+        if use_splitter:
+            # Instantiate our ResidualSplitter wrapper with the EM-calculated threshold
+            splitter = ResidualSplitter(config=self.config)
+            # Treat predictions as zeros for pure residual splitting stage
+            predictions = np.zeros_like(residuals)
+            reset_mask, smooth_residuals, reset_amplitudes = splitter.process_encoding(residuals, predictions)
+            encode_stream(smooth_residuals, config=self.config)
+
+            # B. Reset amplitudes (signed data stream) encoded adaptively
+            amp_bytes, amp_bits, k_amp = ExpGolombCodec.encode_adaptive(reset_amplitudes)
+            self.config["amp_rice_k"] = k_amp
+
+            # C. Reset mask encoded compactly (packed bits into bytes)
+            mask_packed = np.packbits(reset_mask)
+            mask_len = len(reset_mask)
+
+            # Pack all 3 substreams into a container payload structure:
+            # [4 bytes: mask_len] + [4 bytes: mask_bytes_len] + [mask_bytes] +
+            # [4 bytes: amp_bytes_len] + [amp_bytes] + [smooth_bytes]
+            payload_container = bytearray()
+            payload_container.extend(int(mask_len).to_bytes(4, 'little', signed=False))
+            payload_container.extend(int(len(mask_packed)).to_bytes(4, 'little', signed=False))
+            payload_container.extend(mask_packed)
+            payload_container.extend(int(len(amp_bytes)).to_bytes(4, 'little', signed=False))
+            payload_container.extend(amp_bytes)
+            payload_container.extend(smooth_bytes)
+
+            encoded_bytes = bytes(payload_container)
+            total_bits = smooth_bits + amp_bits + len(mask_packed) * 8
+        else:
+            # Standard single stream mode (Pure Laplacian Core or Bypass)
+            encoded_bytes, total_bits, k = ExpGolombCodec.encode_adaptive(residuals)
+            self.config["rice_k"] = k
 
         metadata = {
             "config": self.config
@@ -81,7 +153,6 @@ class CodecBase:
             total_compressed_size = len(header_bytes) + len(compressed_payload_bytes)
             num_symbols = len(residuals)
 
-            # Compute residuals distribution histogram (e.g., 32 bins)
             hist_counts, hist_bins = np.histogram(residuals, bins=self.config.get("bins", 32))
 
             self.stats = {
@@ -98,7 +169,6 @@ class CodecBase:
             }
 
         return header_bytes + compressed_payload_bytes
-
     def decode(self, bitstream: bytes) -> np.ndarray:
         """
         Template method: parses stream header, extracts configuration,
@@ -129,10 +199,49 @@ class CodecBase:
         channels = self.config.get("channels", 1)
 
         raw_payload_bytes = zlib.decompress(compressed_payload_bytes)
-
         res_dtype = np.dtype(self.config.get("residuals_dtype", "int16"))
-        k = self.config.get("rice_k", 0)
-        restored_residuals = GolombRiceCodec.decode_stream(raw_payload_bytes, k=k, res_dtype=res_dtype)
+        use_splitter = self.config.get("use_splitter", False)
+
+        if use_splitter:
+            # Unpack container payload
+            offset = 0
+            mask_len = int.from_bytes(raw_payload_bytes[offset:offset + 4], 'little', signed=False)
+            offset += 4
+            mask_bytes_len = int.from_bytes(raw_payload_bytes[offset:offset + 4], 'little', signed=False)
+            offset += 4
+
+            mask_packed = raw_payload_bytes[offset:offset + mask_bytes_len]
+            offset += mask_bytes_len
+            reset_mask = np.unpackbits(np.frombuffer(mask_packed, dtype=np.uint8))[:mask_len].astype(bool)
+
+            amp_bytes_len = int.from_bytes(raw_payload_bytes[offset:offset + 4], 'little', signed=False)
+            offset += 4
+
+            amp_bytes = raw_payload_bytes[offset:offset + amp_bytes_len]
+            offset += amp_bytes_len
+            smooth_bytes = raw_payload_bytes[offset:]
+
+            # Decode components
+            k_smooth = self.config.get("rice_k", 2)
+            restored_smooth = GolombRiceCodec.decode_stream(smooth_bytes, k=k_smooth, res_dtype=res_dtype)
+
+            k_amp = self.config.get("amp_rice_k", 2)
+            restored_amps = GolombRiceCodec.decode_stream(amp_bytes, k=k_amp, res_dtype=res_dtype)
+
+            # Reconstruct using ResidualSplitter!
+            splitter = ResidualSplitter(threshold=self.config.get("splitter_threshold", 32))
+            dummy_predictions = np.zeros(mask_len, dtype=res_dtype)
+
+            restored_residuals = splitter.process_decoding(
+                predictions=dummy_predictions,
+                reset_mask=reset_mask,
+                smooth_residuals=restored_smooth,
+                reset_amplitudes=restored_amps
+            )
+        else:
+            k = self.config.get("rice_k", 0)
+            restored_residuals = GolombRiceCodec.decode_stream(raw_payload_bytes, k=k, res_dtype=res_dtype)
+
         return self._decode_buffer(restored_residuals, w, h, channels)
 
 
@@ -164,7 +273,7 @@ def test_codec():
     print("Running Codec mini-test...")
 
     # Instantiate codec with custom configuration bundle
-    codec = Codec(target_anchors=150, quality_mode="fast", collect_stats=True)
+    codec = Codec(quality_mode="fast", collect_stats=True)
 
     # Create dummy 2D grayscale raster
     h, w = 32, 48
