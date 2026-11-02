@@ -25,20 +25,33 @@ def encode_stream(residuals: np.ndarray, config: dict) -> tuple:
     based on the configuration profile produced by the UniformTailEstimator.
     """
     recommended_coder = config.get("recommended_coder", "ExpGolomb")
-
+    k = config.get("golomb_k", 0)
     if recommended_coder == "GolombRice":
-        k = config.get("golomb_k", 0)
-        encoded_bytes = GolombRiceCodec.encode_stream(residuals, k=k)
-        total_bits = len(residuals) * (k + 1)
-        return encoded_bytes, total_bits, k
-
+        return GolombRiceCodec.encode_stream(residuals, k=k)
     elif recommended_coder == "ExpGolomb":
-        k = config.get("core_k", 2)
         return ExpGolombCodec.encode_stream(residuals, k=k)
     elif recommended_coder == "Raw":
         encoded_bytes = residuals.tobytes()
         total_bits = residuals.nbytes * 8
-        return encoded_bytes, total_bits, 0
+        return encoded_bytes, total_bits
+    else:
+        raise Exception("Unknown codec")
+
+
+def decode_stream(residuals: np.ndarray, config: dict) -> tuple:
+    """
+    Factory function: selects and executes the optimal entropy coder
+    based on the configuration profile produced by the UniformTailEstimator.
+    """
+    recommended_coder = config.get("recommended_coder", "ExpGolomb")
+    dtype = np.dtype(config.get("residuals_dtype", "int16"))
+    k = config.get("golomb_k", 0)
+    if recommended_coder == "GolombRice":
+        return GolombRiceCodec.decode_stream(residuals, k=k, dtype=dtype)
+    elif recommended_coder == "ExpGolomb":
+        return ExpGolombCodec.decode_stream(residuals, k=k, dtype=dtype)
+    elif recommended_coder == "Raw":
+        return GolombRiceCodec.decode_stream(residuals, k=0, dtype=dtype)
     else:
         raise Exception("Unknown codec")
 
@@ -52,7 +65,6 @@ class CodecBase:
         """
         self.config = {
             "channels": 1,
-            "rice_m": 2,  # Default M parameter for Golomb-Rice coding
             "collect_stats": False,  # Flag to enable/disable statistics collection
         }
         self.config.update(config)
@@ -95,47 +107,43 @@ class CodecBase:
             estimator = UniformTailEstimator(tail_min=self.config.get("tail_min", 32))
             estimator.fit(residuals)
             threshold = estimator.threshold
-            self.config["splitter_threshold"] = threshold
             factory_config = estimator.get_codec_factory_config()
             self.config.update(factory_config)
 
         # Check if splitting should be active (threshold > 0 and distribution calls for a mixture tail)
-        use_splitter = threshold > 0 and self.config.get("distribution_type", "mixture_tail") == "mixture_tail"
+        use_splitter = self.config.get("distribution_type") == "mixture_tail"
         self.config["use_splitter"] = use_splitter
 
         if use_splitter:
             # Instantiate our ResidualSplitter wrapper with the EM-calculated threshold
-            splitter = ResidualSplitter(config=self.config)
+            splitter = ResidualSplitter(threshold)
             # Treat predictions as zeros for pure residual splitting stage
-            predictions = np.zeros_like(residuals)
-            reset_mask, smooth_residuals, reset_amplitudes = splitter.process_encoding(residuals, predictions)
-            encode_stream(smooth_residuals, config=self.config)
-
-            # B. Reset amplitudes (signed data stream) encoded adaptively
-            amp_bytes, amp_bits, k_amp = ExpGolombCodec.encode_adaptive(reset_amplitudes)
-            self.config["amp_rice_k"] = k_amp
-
-            # C. Reset mask encoded compactly (packed bits into bytes)
-            mask_packed = np.packbits(reset_mask)
-            mask_len = len(reset_mask)
+            reset_mask, smooth_residuals, reset_residuals = splitter.split(residuals)
 
             # Pack all 3 substreams into a container payload structure:
             # [4 bytes: mask_len] + [4 bytes: mask_bytes_len] + [mask_bytes] +
             # [4 bytes: amp_bytes_len] + [amp_bytes] + [smooth_bytes]
             payload_container = bytearray()
-            payload_container.extend(int(mask_len).to_bytes(4, 'little', signed=False))
+            # Reset mask encoded compactly (packed bits into bytes)
+            mask_packed = np.packbits(reset_mask)
+            mask_bits = len(mask_packed) * 8
+            payload_container.extend(int(len(reset_mask)).to_bytes(4, 'little', signed=False))
             payload_container.extend(int(len(mask_packed)).to_bytes(4, 'little', signed=False))
             payload_container.extend(mask_packed)
-            payload_container.extend(int(len(amp_bytes)).to_bytes(4, 'little', signed=False))
-            payload_container.extend(amp_bytes)
+            # reset_amplitudes
+            reset_amplitudes_bytes = reset_residuals.tobytes()
+            amp_bits = len(reset_amplitudes_bytes) * 8
+            payload_container.extend(int(len(reset_amplitudes_bytes)).to_bytes(4, 'little', signed=False))
+            payload_container.extend(reset_amplitudes_bytes)
+            # smooth
+            smooth_bytes, smooth_bits = encode_stream(smooth_residuals, config=self.config)
             payload_container.extend(smooth_bytes)
 
             encoded_bytes = bytes(payload_container)
-            total_bits = smooth_bits + amp_bits + len(mask_packed) * 8
+            total_bits = smooth_bits + amp_bits + mask_bits
         else:
             # Standard single stream mode (Pure Laplacian Core or Bypass)
-            encoded_bytes, total_bits, k = ExpGolombCodec.encode_adaptive(residuals)
-            self.config["rice_k"] = k
+            encoded_bytes, total_bits = GolombRiceCodec.encode_stream(residuals, k=self.config["golomb_k"])
 
         metadata = {
             "config": self.config
@@ -149,26 +157,53 @@ class CodecBase:
 
         # 4. Collect performance statistics and residuals histogram if enabled
         if self.config.get("collect_stats", False):
-            original_bytes = img_data.nbytes
-            total_compressed_size = len(header_bytes) + len(compressed_payload_bytes)
-            num_symbols = len(residuals)
+            # --- STATISTICS: THEORETICAL (SHANNON) VS ACTUAL COMPRESSION ---
+            orig_flat = img_data.flatten()
+            orig_symbols = orig_flat.size
+            _, orig_counts = np.unique(orig_flat, return_counts=True)
+            orig_probs = orig_counts.astype(np.float64) / max(1, orig_symbols)
+            original_entropy = -np.sum(orig_probs * np.log2(orig_probs + 1e-12))
 
-            hist_counts, hist_bins = np.histogram(residuals, bins=self.config.get("bins", 32))
+            num_symbols = residuals.size
+            bins_count = self.config.get("bins", 64)
+            hist_counts, hist_bins = np.histogram(residuals, bins=bins_count)
+            probs = hist_counts / max(1, num_symbols)
+            # bin width enthropy correction
+            bin_width = (hist_bins[-1] - hist_bins[0]) / len(hist_counts)
+            shannon_entropy = -np.sum(probs * np.log2(probs + 1e-12)) #+ np.log2(max(1.0, bin_width))
+
+            theoretical_bits = shannon_entropy * num_symbols
+            theoretical_bytes = int(np.ceil(theoretical_bits / 8.0))
+
+            original_bytes = num_symbols * img_data.itemsize
+            actual_payload_bytes = len(compressed_payload_bytes)
+            total_compressed_size = len(header_bytes) + actual_payload_bytes
+            actual_bits_per_symbol = (actual_payload_bytes * 8.0) / max(1, num_symbols)
 
             self.stats = {
-                "total_symbols": num_symbols,
-                "bits_per_symbol": total_bits / max(1, num_symbols),
-                "original_bytes": original_bytes,
-                "compressed_payload_bytes": len(compressed_payload_bytes),
-                "total_stream_bytes": total_compressed_size,
-                "compression_ratio": original_bytes / max(1, total_compressed_size),
+                "total_symbols": int(num_symbols),
+
+                "original_entropy": original_entropy * orig_symbols,
+                "original_bits_per_symbol": original_entropy,
+
+                "theoretical_entropy": float(shannon_entropy),
+                "theoretical_payload_bytes": int(theoretical_bytes),
+                "theoretical_compression_ratio": float(original_bytes / max(1, theoretical_bytes)),
+
+                # --- ACTUAL PERFORMANCE ---
+                "actual_bits_per_symbol": float(actual_bits_per_symbol),
+                "original_bytes": int(original_bytes),
+                "compressed_payload_bytes": int(actual_payload_bytes),
+                "total_stream_bytes": int(total_compressed_size),
+                "compression_ratio": float(original_bytes / max(1, total_compressed_size)),
+
                 "residuals_histogram": {
                     "counts": hist_counts.tolist(),
-                    "bins": hist_bins.tolist()
+                    "bin_width": bin_width
                 }
             }
-
         return header_bytes + compressed_payload_bytes
+
     def decode(self, bitstream: bytes) -> np.ndarray:
         """
         Template method: parses stream header, extracts configuration,
@@ -218,28 +253,22 @@ class CodecBase:
             offset += 4
 
             amp_bytes = raw_payload_bytes[offset:offset + amp_bytes_len]
+            res_dtype = np.dtype(self.config.get("residuals_dtype", "int16"))
+            decoded_resets = np.frombuffer(amp_bytes, dtype=res_dtype)
+
             offset += amp_bytes_len
             smooth_bytes = raw_payload_bytes[offset:]
-
-            # Decode components
-            k_smooth = self.config.get("rice_k", 2)
-            restored_smooth = GolombRiceCodec.decode_stream(smooth_bytes, k=k_smooth, res_dtype=res_dtype)
-
-            k_amp = self.config.get("amp_rice_k", 2)
-            restored_amps = GolombRiceCodec.decode_stream(amp_bytes, k=k_amp, res_dtype=res_dtype)
+            smooth_residuals = decode_stream(smooth_bytes, self.config)
 
             # Reconstruct using ResidualSplitter!
-            splitter = ResidualSplitter(threshold=self.config.get("splitter_threshold", 32))
-            dummy_predictions = np.zeros(mask_len, dtype=res_dtype)
-
-            restored_residuals = splitter.process_decoding(
-                predictions=dummy_predictions,
+            splitter = ResidualSplitter(-1)
+            restored_residuals = splitter.merge(
                 reset_mask=reset_mask,
-                smooth_residuals=restored_smooth,
-                reset_amplitudes=restored_amps
+                smooth_residuals=smooth_residuals,
+                reset_amplitudes=decoded_resets
             )
         else:
-            k = self.config.get("rice_k", 0)
+            k = self.config.get("golomb_k", 0)
             restored_residuals = GolombRiceCodec.decode_stream(raw_payload_bytes, k=k, res_dtype=res_dtype)
 
         return self._decode_buffer(restored_residuals, w, h, channels)

@@ -120,7 +120,7 @@ class UniformTailEstimator:
         self.threshold = None
         self.distribution_type = None  # 'laplacian_core', 'mixture_tail', 'uniform_bypass'
 
-    def fit(self, residuals: np.ndarray):
+    def fit_(self, residuals: np.ndarray):
         n_samples = residuals.size
 
         if n_samples < 10:
@@ -228,6 +228,131 @@ class UniformTailEstimator:
 
         return self
 
+    def fit(self, residuals: np.ndarray):
+        n_samples = residuals.size
+
+        if n_samples < 10:
+            self.lambda_core = 2.0
+            self.pi = 0.05
+            self.threshold = 50
+            self.distribution_type = 'laplacian_core'
+            return self
+
+        # --- DYNAMIC SAMPLE SIZE VIA CLT & MAD VARIANCE ---
+        pilot_size = min(1000, n_samples)
+        pilot_indices = np.random.choice(n_samples, size=pilot_size, replace=False)
+        pilot_residuals = residuals[pilot_indices]
+
+        pilot_abs = np.abs(pilot_residuals)
+
+        # FIX: Filter out potential spikes from pilot estimation to get true core lambda
+        # We take only points below tail_min or below 90th percentile to avoid tail bias
+        safe_core_mask = pilot_abs < max(self.tail_min, np.percentile(pilot_abs, 85))
+        core_pilot = pilot_abs[safe_core_mask]
+
+        if core_pilot.size > 10:
+            rough_mad = np.median(core_pilot)
+        else:
+            rough_mad = np.median(pilot_abs)
+
+        rough_lambda = max(float(rough_mad / 0.693147), 0.5)
+
+        self.lambda_core = rough_lambda
+        # Initial guess for threshold r_t (e.g., 3 * MAD or tail_min)
+        self.r_t = float(max(self.tail_min, rough_mad * 3.0))
+        # Select only the pilot elements that belong to the tail region
+        tail_pilot = pilot_abs[pilot_abs >= self.r_t]
+        if tail_pilot.size > 5:
+            # Measure empirical spread of actual tail elements relative to r_t
+            rough_sigma = float(np.std(tail_pilot - self.r_t))
+        else:
+            # Fallback if pilot didn't catch enough tail points
+            rough_sigma = rough_lambda * 4.0
+
+        self.sigma_tail = max(rough_sigma, rough_lambda * 2.0)
+        self.pi = np.clip(tail_pilot.size / pilot_size, 0.001, 0.4)
+
+        # CLT Sample size estimation
+        optimal_fit_samples = samples_number(
+            w=0.9,
+            laplace_lambda=rough_lambda,
+            L=self.r_t,
+            U=self.r_t + self.sigma_tail * 3,
+            epsilon=0.1,
+            confidence=0.95
+        )
+        optimal_fit_samples = int(np.clip(optimal_fit_samples, 1000, min(n_samples, 50000)))
+
+        # Subsampling
+        if n_samples > optimal_fit_samples:
+            indices = np.random.choice(n_samples, size=optimal_fit_samples, replace=False)
+            selection = residuals[indices]
+            n_samples = optimal_fit_samples
+        else:
+            selection = residuals
+
+        abs_res = np.abs(selection)
+
+        # --- EM-ALGORITHM (Laplace Core + Shifted Gaussian-like Tail) ---
+        for _ in range(self.max_iters):
+            # 1. Core density (Laplace)
+            pdf_core = (1.0 / (2.0 * self.lambda_core)) * np.exp(-abs_res / self.lambda_core)
+
+            # 2. Shifted Tail density: active when |r| >= r_t
+            # Normalization factor C for the two-sided shifted tail
+            # We can approximate normalization or compute it dynamically based on sigma_tail
+            tail_exponent = -((abs_res - self.r_t) ** 2) / (2.0 * (self.sigma_tail ** 2))
+            # Restrict tail activation strictly beyond r_t to avoid bleeding into the core
+            pdf_tail = np.where(abs_res >= self.r_t, np.exp(tail_exponent), 1e-10)
+
+            denom = (1.0 - self.pi) * pdf_core + self.pi * pdf_tail + 1e-12
+            gamma = (self.pi * pdf_tail) / denom
+
+            sum_gamma = np.sum(gamma)
+            sum_one_gamma = n_samples - sum_gamma
+
+            # M-step: Update mixing weight pi
+            self.pi = np.clip(sum_gamma / n_samples, 0.001, 0.4)
+
+            # M-step: Update Laplace core scale
+            if sum_one_gamma > 1.0:
+                self.lambda_core = np.sum((1.0 - gamma) * abs_res) / sum_one_gamma
+            self.lambda_core = max(self.lambda_core, 0.5)
+
+            # M-step: Update tail dispersion (sigma) weighted by responsibilities past r_t
+            sum_gamma_safe = max(sum_gamma, 1.0)
+            diff_from_rt = np.maximum(0.0, abs_res - self.r_t)
+            self.sigma_tail = np.sqrt(np.sum(gamma * (diff_from_rt ** 2)) / sum_gamma_safe)
+            self.sigma_tail = max(self.sigma_tail, 1.0)
+
+        # --- BAYESIAN DECISION BOUNDARY (Optimal Threshold T) ---
+        max_abs_res = float(np.max(abs_res))
+
+        if self.lambda_core >= self.target_lambda_limit:
+            self.distribution_type = 'uniform'
+            self.threshold = -1
+            return self
+
+        if self.pi < 0.005:
+            self.distribution_type = 'laplacian'
+            self.threshold = int(max_abs_res + 1)
+            return self
+
+        # Find exact intersection grid where Laplace core density matches the Shifted Tail density
+        grid = np.linspace(0, max_abs_res, num=500)
+        c_core = (1.0 - self.pi) * (1.0 / (2.0 * self.lambda_core)) * np.exp(-grid / self.lambda_core)
+        c_tail = self.pi * np.where(grid >= self.r_t,
+                                    np.exp(-((grid - self.r_t) ** 2) / (2.0 * (self.sigma_tail ** 2))), 0.0)
+
+        crossover_indices = np.where(c_core <= c_tail)[0]
+        if crossover_indices.size > 0:
+            self.threshold = int(grid[crossover_indices[0]])
+        else:
+            self.threshold = int(self.r_t)
+
+        self.distribution_type = 'mixture_tail'
+        return self
+
     def get_codec_factory_config(self) -> dict:
         """
         Factory method to provide optimal coder routing parameters
@@ -237,24 +362,25 @@ class UniformTailEstimator:
             "distribution_type": self.distribution_type,
             "lambda_core": self.lambda_core,
             "mixing_pi": self.pi,
-            "threshold": self.threshold
+            "threshold": self.threshold,
         }
 
-        if self.distribution_type == 'laplacian_core':
+        if self.distribution_type == 'laplacian':
             # Optimal for standard Golomb-Rice
             k = max(0, int(np.floor(np.log2(self.lambda_core * 0.693147))))
-            config["recommended_coder"] = "GolombRice"
-            config["golomb_k"] = k
+            recommended_coder = "GolombRice"
 
         elif self.distribution_type == 'mixture_tail':
             # Optimal for Exp-Golomb core + Raw tail
             k = max(0, int(np.floor(np.log2(self.lambda_core * 0.693147))))
-            config["recommended_coder"] = "ExpGolomb"
-            config["core_k"] = k
-
+            recommended_coder = "ExpGolomb"
         else:
             # Fallback for diffuse noise
-            config["recommended_coder"] = "Raw"
+            recommended_coder = "Raw"
+            k = 0
+
+        config["golomb_k"] = k
+        config["recommended_coder"] = recommended_coder
 
         return config
 
@@ -264,90 +390,55 @@ class ResidualSplitter:
     Execution engine: splits residuals into core and tail streams
     based on the provided config or automatic estimation via UniformTailEstimator.
     """
+    def __init__(self, splitter_threshold):
+        self.splitter_threshold = splitter_threshold
 
-    def __init__(self, config: dict = None):
-        self.config = config or {}
-
-    def process_encoding(self, signal: np.ndarray, predictions: np.ndarray) -> tuple:
-        signal = np.asarray(signal, dtype=np.int32)
-        predictions = np.asarray(predictions, dtype=np.int32)
-        residuals = signal - predictions
-
-        threshold = self.config.get("splitter_threshold", -1)
-
-        # Automatically compute threshold using the estimator if not explicitly provided
-        if threshold <= 0:
-            if residuals.size > 0:
-                estimator = UniformTailEstimator(tail_min=self.config.get("tail_min", 32))
-                estimator.fit(residuals)
-
-                threshold = estimator.threshold
-                # Save analyzed stats back to config for encoder routing
-                self.config.update(estimator.get_codec_factory_config())
-            else:
-                threshold = 32
-
-            self.config["splitter_threshold"] = threshold
-
+    def split(self, residuals: np.ndarray) -> tuple:
         # Check if splitting should be active
-        use_splitter = threshold > 0
-        if not use_splitter:
+        if self.splitter_threshold <= 0:
             # Splitter bypassed: return empty reset mask, all residuals go to core stream
             return np.zeros_like(residuals, dtype=bool), residuals, np.array([], dtype=np.int32)
-
-        reset_mask = np.abs(residuals) > threshold
-        smooth_residuals = np.where(reset_mask, 0, residuals)
-        reset_amplitudes = signal[reset_mask]
+        else:
+            reset_mask = np.abs(residuals) > self.splitter_threshold
+            smooth_residuals = np.where(reset_mask, 0, residuals)
+            reset_amplitudes = residuals[reset_mask]
 
         return reset_mask, smooth_residuals, reset_amplitudes
 
-    def process_decoding(self, predictions: np.ndarray, reset_mask: np.ndarray,
-                         smooth_residuals: np.ndarray, reset_amplitudes: np.ndarray) -> np.ndarray:
-        predictions = np.asarray(predictions, dtype=np.int32)
-        reset_mask = np.asarray(reset_mask, dtype=bool)
-        smooth_residuals = np.asarray(smooth_residuals, dtype=np.int32)
-        reset_amplitudes = np.asarray(reset_amplitudes, dtype=np.int32)
-
-        reconstructed = np.empty_like(predictions)
-        amp_idx = 0
-        for i in range(len(predictions)):
-            if reset_mask[i]:
-                reconstructed[i] = reset_amplitudes[amp_idx]
-                amp_idx += 1
-            else:
-                reconstructed[i] = predictions[i] + smooth_residuals[i]
-        return reconstructed
+    def merge(self, reset_mask: np.ndarray,
+              smooth_residuals: np.ndarray, reset_amplitudes: np.ndarray) -> np.ndarray:
+        reset_indices = np.where(reset_mask)[0]
+        residuals = smooth_residuals.copy()
+        residuals[reset_indices] = reset_amplitudes
+        return residuals
 
 
-def test_residual_splitter(splitter):
+def test_residual_splitter():
+    splitter = ResidualSplitter(5)
     print(f"\n--- TEST: {splitter.__class__.__name__} 3-Stream Architecture ---")
 
     signal = np.array([100, 102, 105, 103, 500, 502, 505, 501], dtype=np.int32)
     predictions = np.array([98, 101, 103, 104, 200, 490, 500, 498], dtype=np.int32)
 
-    reset_mask, smooth_residuals, reset_amplitudes = splitter.process_encoding(signal, predictions)
+    reset_mask, smooth_residuals, reset_amplitudes = splitter.split(signal - predictions)
 
     print(f"Signal:            {signal}")
     print(f"Predictions:       {predictions}")
     print(f"Raw Residuals:     {signal - predictions}")
-    if hasattr(splitter, 'threshold'):
-        print(f"Active Threshold:  {splitter.config['threshold']}")
-    if hasattr(splitter, 'lambda_core'):
-        print(f"Estimated Lambda:  {splitter.config['lambda_core']:.2f}")
     print(f"Reset Mask:        {reset_mask.astype(int)}")
     print(f"Smooth Residuals:  {smooth_residuals}")
     print(f"Reset Amplitudes:  {reset_amplitudes}")
 
-    reconstructed_signal = splitter.process_decoding(predictions, reset_mask, smooth_residuals, reset_amplitudes)
-    print(f"Reconstructed:     {reconstructed_signal}")
+    reconstructed_residuals = splitter.merge(reset_mask, smooth_residuals, reset_amplitudes)
+    print(f"Reconstructed:     {reconstructed_residuals + predictions}")
 
-    assert np.array_equal(signal, reconstructed_signal), "[FAIL] Splitter reconstruction mismatch!"
+    assert np.array_equal(signal, reconstructed_residuals + predictions), "[FAIL] Splitter reconstruction mismatch!"
     assert np.sum(reset_mask) == len(reset_amplitudes), "[FAIL] Amplitude count mismatch with reset mask!"
 
     print(f"[PASS] {splitter.__class__.__name__} 3-stream roundtrip verified successfully.")
 
 
-def test_uniform_tail_parameter_estimation(splitter):
+def test_uniform_tail_parameter_estimation():
     print("\n--- TEST: Parameter Estimation Accuracy for UniformTailResidualSplitter ---")
 
     np.random.seed(42)
@@ -356,7 +447,7 @@ def test_uniform_tail_parameter_estimation(splitter):
     true_lambda = 3.5
     true_pi = 0.04  # 4% heavy tails
 
-    core_noise = np.random.laplace(loc=0.0, scale=true_lambda, size=n_samples).astype(np.int32)
+    core_noise = np.round(np.random.laplace(loc=0.0, scale=true_lambda, size=n_samples)).astype(np.int32)
 
     spike_mask = np.random.rand(n_samples) < true_pi
     spikes = np.where(np.random.rand(n_samples) > 0.5,
@@ -366,27 +457,89 @@ def test_uniform_tail_parameter_estimation(splitter):
     residuals = np.where(spike_mask, spikes, core_noise)
     predictions = np.random.randint(500, 1000, size=n_samples, dtype=np.int32)
     signal = predictions + residuals
-
-    reset_mask, smooth_residuals, reset_amplitudes = splitter.process_encoding(signal, predictions)
+    estimator = UniformTailEstimator()
+    estimator.fit(residuals)
+    splitter = ResidualSplitter(estimator.threshold)
+    reset_mask, smooth_residuals, reset_amplitudes = splitter.split(residuals)
 
     print(f"Total Samples:       {n_samples}")
     print(f"True Core Lambda:    {true_lambda}")
-    print(f"Estimated Lambda:    {splitter.config['lambda_core']:.2f}")
+    print(f"Estimated Lambda:    {estimator.lambda_core:.2f}")
     print(f"True Mixing Pi:      {true_pi}")
-    print(f"Estimated Mixing Pi: {splitter.config['mixing_pi']:.4f}")
-    print(f"Calculated Threshold:{splitter.config['threshold']}")
+    print(f"Estimated Mixing Pi: {estimator.pi:.4f}")
+    print(f"Calculated Threshold:{estimator.threshold}")
     print(f"Detected Resets:     {np.sum(reset_mask)} (True spikes: {np.sum(spike_mask)})")
 
-    assert abs(splitter.config['lambda_core'] - true_lambda) < 0.5, "[FAIL] Lambda core estimation error is too high!"
-    assert abs(splitter.config['mixing_pi'] - true_pi) < 0.02, "[FAIL] Mixing weight pi estimation error is too high!"
+    assert abs(estimator.lambda_core - true_lambda) < 0.5, "[FAIL] Lambda core estimation error is too high!"
+    assert abs(estimator.pi - true_pi) < 0.02, "[FAIL] Mixing weight pi estimation error is too high!"
 
-    reconstructed_signal = splitter.process_decoding(predictions, reset_mask, smooth_residuals, reset_amplitudes)
+    reconstructed_signal = splitter.merge(reset_mask, smooth_residuals, reset_amplitudes) + predictions
     assert np.array_equal(signal, reconstructed_signal), "[FAIL] Reconstruction mismatch!"
 
     print("[PASS] Parameter estimation and roundtrip test passed successfully.")
 
 
-if __name__ == "__main__":
-    test_residual_splitter(ResidualSplitter())
-    test_uniform_tail_parameter_estimation(ResidualSplitter())
+def test_pure_laplace_estimation():
+    print("\n--- TEST: Pure Laplace (Smooth Plains/Hills) ---")
 
+    np.random.seed(42)
+    n_samples = 5000
+    true_lambda = 2.5
+
+    residuals = np.random.laplace(loc=0.0, scale=true_lambda, size=n_samples).astype(np.int32)
+    predictions = np.random.randint(500, 1000, size=n_samples, dtype=np.int32)
+    signal = predictions + residuals
+    estimator = UniformTailEstimator()
+    estimator.fit(residuals)
+    splitter = ResidualSplitter(estimator.threshold)
+    reset_mask, smooth_residuals, reset_amplitudes = splitter.split(residuals)
+
+    print(f"Total Samples:       {n_samples}")
+    print(f"True Core Lambda:    {true_lambda}")
+    print(f"Estimated Lambda:    {estimator.lambda_core:.2f}")
+    print(f"Estimated Mixing Pi: {estimator.pi:.4f}")
+    print(f"Distribution Type:   {estimator.distribution_type}")
+    print(f"Detected Resets:     {np.sum(reset_mask)} (Expected: 0)")
+
+    assert abs(estimator.lambda_core - true_lambda) < 0.5, "[FAIL] Lambda core estimation error for pure Laplace is too high!"
+    assert estimator.distribution_type == 'laplacian', "[FAIL] Expected 'laplacian_core' classification!"
+    assert np.sum(reset_mask) == 0, "[FAIL] False positive spikes detected in pure Laplace terrain!"
+
+    reconstructed_signal = splitter.merge(reset_mask, smooth_residuals, reset_amplitudes) + predictions
+    assert np.array_equal(signal, reconstructed_signal), "[FAIL] Reconstruction mismatch in pure Laplace mode!"
+
+    print("[PASS] Pure Laplace estimation and roundtrip test passed successfully.")
+
+
+def test_pure_uniform_noise_estimation():
+    print("\n--- TEST: High-Entropy Noise / Uniform Bypass Regime ---")
+
+    np.random.seed(42)
+    n_samples = 5000
+
+    residuals = np.random.randint(-80, 81, size=n_samples).astype(np.int32)
+    predictions = np.random.randint(500, 1000, size=n_samples, dtype=np.int32)
+    signal = predictions + residuals
+    estimator = UniformTailEstimator()
+    estimator.fit(residuals)
+    splitter = ResidualSplitter(estimator.threshold)
+
+    reset_mask, smooth_residuals, reset_amplitudes = splitter.split(residuals)
+
+    print(f"Total Samples:       {n_samples}")
+    print(f"Estimated Lambda:    {estimator.lambda_core:.2f}")
+    print(f"Estimated Mixing Pi: {estimator.pi:.4f}")
+    print(f"Distribution Type:   {estimator.distribution_type}")
+
+    assert estimator.distribution_type == 'uniform', "[FAIL] Expected 'uniform_bypass' for high-entropy noise!"
+
+    reconstructed_signal = splitter.merge(reset_mask, smooth_residuals, reset_amplitudes) + predictions
+    assert np.array_equal(signal, reconstructed_signal), "[FAIL] Reconstruction mismatch in bypass mode!"
+    print("[PASS] Uniform noise bypass and roundtrip test passed successfully.")
+
+
+if __name__ == "__main__":
+    test_residual_splitter()
+    test_uniform_tail_parameter_estimation()
+    test_pure_uniform_noise_estimation()
+    test_pure_laplace_estimation()

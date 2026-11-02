@@ -308,7 +308,7 @@ class ExpGolombCodec:
         return writer.flush()
 
     @classmethod
-    def decode_stream(cls, encoded_bytes: bytes, k: int = 2, res_dtype=np.int16) -> np.ndarray:
+    def decode_stream(cls, encoded_bytes: bytes, k: int = 2, dtype=np.int16) -> np.ndarray:
         reader = BitReader(encoded_bytes)
         unsigned_vals = []
         k_int = int(k)
@@ -328,12 +328,12 @@ class ExpGolombCodec:
             val = (q << k_int) + r
             unsigned_vals.append(val)
 
-        if np.issubdtype(res_dtype, np.signedinteger):
+        if np.issubdtype(dtype, np.signedinteger):
             res = cls._unsigned_to_signed(unsigned_vals)
         else:
             res = unsigned_vals
 
-        return np.array(res, dtype=res_dtype)
+        return np.array(res, dtype=dtype)
 
     @staticmethod
     def encode_adaptive(residuals: np.ndarray):
